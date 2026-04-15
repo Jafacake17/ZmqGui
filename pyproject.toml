@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zmq-gui"
+version = "0.1.0"
+description = "ZMQ-subscriber dashboard — like-for-like port of the ModularTradeApp console GUI, consumable by any ZMQ-publishing app."
+requires-python = ">=3.10"
+dependencies = [
+    "nicegui>=1.4",
+    "pyzmq>=25",
+    "pyyaml>=6",
+    "plotly>=5",
+]
+
+[project.scripts]
+zmq-gui = "zmq_gui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

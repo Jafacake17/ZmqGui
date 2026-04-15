@@ -1,0 +1,59 @@
+# ZmqGui configuration — see README for usage.
+# Copy this file to config.yaml and edit to point at your ZMQ sources.
+
+# HTTP port for the NiceGUI web server.
+web_port: 8080
+
+# PUB sockets to subscribe to. Topics are not filtered — the dashboard
+# accepts fill.*, metric.*, heartbeat.*, arb.*, tick.*, command. Any
+# number of sources are merged onto a single internal SUB socket.
+#
+# Default values match ModularTradeApp (orchestrator fills on 5552,
+# feed on 5550) and Arbitrage scanner sidecar (5562). Remove what
+# you don't need or add more.
+sources:
+  # ModularTradeApp orchestrator — fills, metrics, heartbeats, commands.
+  - tcp://127.0.0.1:5552
+  # Arbitrage scanner sidecar (arb.scan snapshots, arb heartbeats).
+  - tcp://127.0.0.1:5562
+
+# Separate PUB socket for tick prices (used by Open Trades to show
+# unrealised P&L). Optional — leave null to disable the feed.
+feed_source: tcp://127.0.0.1:5550
+
+# --- Tab visibility ---
+# Hide tabs you don't need. The backend state keeps tracking
+# everything regardless, so you can turn tabs on/off at will.
+tabs:
+  console: true
+  ftmo:    true
+  arb:     true
+
+# --- FTMO tab ---
+# The FTMO tab reads EA activity directly from the MT5 log files,
+# so it needs a local filesystem path (ZMQ-only would require a
+# sidecar that parses the logs and publishes — future work).
+ftmo:
+  # Path to the MetaTrader 5 install (wine prefix on Linux,
+  # native path on Windows).
+  mt5_dir: "~/.wine/drive_c/Program Files/MetaTrader 5"
+  # Static strings shown at the top of the FTMO tab.
+  account_summary: "Account: 1513089764 | FTMO-Demo | £140,000"
+  ea_summary:      "EA: GoldDonchianStochFade | XAUUSD H1 | 6.0 lots"
+  # Progress card values.
+  challenge:
+    account_gbp:   140000
+    target_gbp:    7000
+    max_dd_gbp:    14000
+    daily_dd_gbp:  7000
+    min_days:      2
+    period_days:   14
+    lot_size:      6.0
+    expected_pnl:  7573
+    expected_dd:   4047
+
+# --- Arbitrage tab ---
+# Path to Arbitrage repo's config.json so the Config card can
+# display sports / stake / margin thresholds.
+arb:
+  config_path: "~/Arbitrage/config.json"
