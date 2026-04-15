@@ -10,3 +10,6 @@ venv/
 dist/
 build/
 config.yaml
+
+# Runtime log from `python -m zmq_gui` when redirected to a file
+*.log
