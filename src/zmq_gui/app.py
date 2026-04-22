@@ -32,7 +32,7 @@ from collections import deque
 from typing import Optional
 
 import zmq
-from nicegui import ui
+from nicegui import app, ui
 
 from .bus import Bus
 from .config import GuiCfg, load as load_config
@@ -48,6 +48,259 @@ logger = logging.getLogger(__name__)
 # Maximum items to keep in memory for display
 MAX_TRADE_LOG = 200
 MAX_PNL_POINTS = 500
+
+# Strategy IDs that publish fills via the ZMQ envelope but aren't part
+# of the main trader book — they have their own dedicated tabs. Keep
+# these OUT of the trader-tab cumulative P&L so the chart reflects
+# plugin trading only. Extend when adding non-trader sidecars.
+_SIDECAR_SIDS = {"arbitrage", "arbitrage_live"}
+
+
+# ---------------------------------------------------------------------- #
+# Condition-chip rendering
+# ---------------------------------------------------------------------- #
+
+def _fmt_trace_num(v) -> str:
+    """Short numeric formatter for condition chips.
+
+    Same rules as the one in ModularTradeApp's harness — keep them
+    visually consistent."""
+    if v is None:
+        return "?"
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return str(v)[:12]
+    if abs(fv) >= 1000:
+        return f"{fv:.2f}"
+    return f"{fv:.4f}".rstrip("0").rstrip(".")
+
+
+def _short_cond_label(full: str) -> str:
+    """`indicator.hurst` → `hurst`. Drop only the 'indicator.' prefix
+    since it's 90% of conditions in practice; keep `time.`/`price.`/
+    `gap.` explicit so the condition origin stays readable."""
+    if full.startswith("indicator."):
+        return full[len("indicator."):]
+    return full
+
+
+def _build_strategy_rows(strategies: dict,
+                          allowed_strats: set | None,
+                          strat_to_scenarios: dict,
+                          broker_spreads: dict,
+                          scenario_spread_gates: dict | None = None) -> list[dict]:
+    """Build one row per (strategy, symbol) for the strategy table.
+
+    When a plugin trades multiple instruments it emits per-symbol
+    traces (entry_traces_by_symbol / filter_traces_by_symbol /
+    filter_blocks_by_symbol). We produce one row per symbol so the
+    conditions chips don't flicker every tick between instruments.
+
+    For plugins that haven't emitted per-symbol traces yet (old harness,
+    or before first tick), fall back to a single row with whatever
+    singular trace is available.
+    """
+    rows: list[dict] = []
+    for sid, info in sorted(strategies.items()):
+        if sid == "arbitrage":
+            continue
+        if allowed_strats is not None and sid not in allowed_strats:
+            continue
+
+        status = info.get("status", "unknown")
+        hb_age = time.time() - info.get("last_heartbeat", 0)
+        if hb_age > 15 and status == "running":
+            status = "stale"
+
+        last_metric = info.get("last_metric", "")
+        hb_activity = info.get("_heartbeat_activity", "")
+        display_text = last_metric if last_metric else hb_activity
+        scen_ids = strat_to_scenarios.get(sid, [])
+
+        # Pull per-symbol maps (each may be absent on a cold start).
+        etbs = info.get("_entry_traces_by_symbol") or {}
+        ftbs = info.get("_filter_traces_by_symbol") or {}
+        fbbs = info.get("_filter_blocks_by_symbol") or {}
+        # Union of symbols seen anywhere in the per-symbol maps.
+        symbols = sorted(set(etbs) | set(ftbs) | set(fbbs))
+
+        if not symbols:
+            # Fall back to a single aggregated row so the strategy
+            # still appears while warmup/first-tick is pending.
+            rows.append({
+                "strategy_symbol": f"{sid}::",
+                "strategy": sid,
+                "symbol": "—",
+                "status": status.upper(),
+                "last_signal": display_text,
+                "condition_chips": _build_condition_chips(info),
+                "scenario_chips": _build_scenario_chips(
+                    scen_ids, "—", scenario_spread_gates),
+                "spread_chips": _build_spread_chips("—", broker_spreads),
+            })
+            continue
+
+        for sym in symbols:
+            per = {
+                "_entry_trace": etbs.get(sym),
+                "_filter_trace": ftbs.get(sym),
+                "_filter_block": fbbs.get(sym),
+            }
+            rows.append({
+                "strategy_symbol": f"{sid}::{sym}",
+                "strategy": sid,
+                "symbol": sym,
+                "status": status.upper(),
+                "last_signal": display_text,
+                "condition_chips": _build_condition_chips(per),
+                "scenario_chips": _build_scenario_chips(
+                    scen_ids, sym, scenario_spread_gates),
+                "spread_chips": _build_spread_chips(sym, broker_spreads),
+            })
+    return rows
+
+
+def _build_scenario_chips(scenario_ids: list[str], symbol: str,
+                          scenario_spread_gates: dict | None) -> list[dict]:
+    """One pill per scenario this (strategy, symbol) routes to, coloured
+    by whether that scenario's per-scenario spread gate would PASS on
+    the current quote. Scenarios without a gate configured render in
+    the neutral grey.
+
+    Shape of each chip: {id, color, title}. `title` is an HTML tooltip
+    summarising the gate state. Passed/failed colouring only covers
+    the spread gate right now — richer risk-gate status can be layered
+    in later without changing the Vue template.
+    """
+    if not scenario_ids:
+        return []
+    gates = scenario_spread_gates or {}
+    chips = []
+    for sid in scenario_ids:
+        g = (gates.get(sid) or {}).get(symbol)
+        if g is None:
+            # No gate defined OR no quote yet — neutral
+            color = TEXT_SECONDARY
+            title = "no scenario spread gate" if sid not in gates else \
+                    f"{sid}: no quote for {symbol}"
+        elif g.get("passed"):
+            color = GREEN
+            title = (f"{sid}: {g.get('data_source')} {g.get('spread_bps')} bps "
+                     f"≤ {g.get('threshold_bps')} bps")
+        else:
+            color = RED
+            title = (f"{sid}: {g.get('data_source')} {g.get('spread_bps')} bps "
+                     f"> {g.get('threshold_bps')} bps → blocks routing")
+        chips.append({"id": sid, "color": color, "title": title})
+    return chips
+
+
+def _build_spread_chips(symbol: str, broker_spreads: dict) -> list[dict]:
+    """One chip per broker carrying that symbol's current spread (bps).
+
+    Colours by magnitude: green when < 1 bps, yellow 1-3 bps, red > 3 bps
+    — tuned for FX majors. A stale quote (age > 15s) shows in grey to
+    signal "no recent data, don't trust this number".
+    """
+    if symbol == "—" or not broker_spreads:
+        return []
+    chips = []
+    for broker in sorted(broker_spreads.keys()):
+        sym_map = broker_spreads.get(broker) or {}
+        entry = sym_map.get(symbol)
+        if not entry:
+            continue
+        bps = entry.get("spread_bps")
+        age = entry.get("age_s") or 0
+        if bps is None:
+            color = TEXT_SECONDARY
+            display = "—"
+        elif age > 15:
+            color = TEXT_SECONDARY
+            display = f"{bps} (stale)"
+        elif bps < 1.0:
+            color = GREEN
+            display = str(bps)
+        elif bps < 3.0:
+            color = YELLOW
+            display = str(bps)
+        else:
+            color = RED
+            display = str(bps)
+        chips.append({"broker": broker, "bps": display, "color": color})
+    return chips
+
+
+def _build_condition_chips(info: dict) -> list[dict]:
+    """Produce the list of {label, color} chips for one strategy row.
+
+    Renders every filter AND every entry condition from the latest
+    heartbeat trace, each as a separate chip coloured by its state:
+
+      green  — passed
+      red    — failed
+      yellow — warming up (indicator not ready yet)
+
+    Order: filters first (they run first in the engine), then entry
+    conditions. When a filter is blocking, entry conditions may be
+    stale — the GUI still shows them, greyed out, so the operator sees
+    the full pipeline rather than just the first blocker.
+
+    Returns [] if no data yet.
+    """
+    chips: list[dict] = []
+
+    # Filters — one chip per filter, ordered as they appear in the spec.
+    # Prefer the new filter_trace (full list); fall back to the legacy
+    # single filter_block for backward compatibility with older plugin
+    # builds still on the old harness.
+    ftrace = info.get("_filter_trace")
+    if ftrace:
+        for entry in ftrace:
+            passed = entry.get("passed")
+            color = GREEN if passed else RED
+            fname = entry.get("filter", "?")
+            detail = entry.get("detail", "")
+            chips.append({
+                "label": f"{fname}: {detail}" if detail else fname,
+                "color": color,
+            })
+    else:
+        fb = info.get("_filter_block")
+        if fb:
+            chips.append({
+                "label": f"blocked by {fb.get('filter', '?')}: {fb.get('detail', '')}",
+                "color": RED,
+            })
+
+    # Entry conditions — only meaningful when all filters pass; when
+    # filters are blocking, the entry trace is stale but still
+    # informative (shows what the condition WOULD have evaluated to).
+    # A separator makes the two groups easier to read.
+    trace = info.get("_entry_trace") or {}
+    conds = trace.get("conditions") or {}
+    if conds:
+        for full_label, entry in conds.items():
+            passed = entry.get("passed")
+            if passed is True:
+                color = GREEN
+            elif passed is False:
+                color = RED
+            else:
+                color = YELLOW
+            name = _short_cond_label(full_label)
+            op = entry.get("op", "")
+            obs = _fmt_trace_num(entry.get("observed"))
+            thr = _fmt_trace_num(entry.get("threshold"))
+            if passed is None:
+                chips.append({"label": f"{name}: warming up", "color": color})
+            else:
+                chips.append({
+                    "label": f"{name}: {obs} {op} {thr}",
+                    "color": color,
+                })
+    return chips
 
 # Dedup window for fills — publishers may dual-publish every fill on
 # both `fill.<scenario>.<strategy>` and `fill.<strategy>` during the
@@ -82,12 +335,34 @@ class Dashboard:
         # the strategy table behaves as if only one scenario exists.
         self._scenarios: dict[str, dict] = {}
 
+        # Authoritative map {scenario_id: [strategy_ids]} from the
+        # orchestrator's heartbeat. Drives the scenario filter toggle
+        # above the strategy table.
+        self._scenario_strategies: dict[str, list[str]] = {}
+        # Current filter selection ("All" or a scenario id).
+        self._scenario_filter: str = "All"
+        # Per-broker current spread snapshot for the Spread column.
+        # Shape: {broker: {symbol: {bid, ask, spread_bps, age_s}}}
+        self._broker_spreads: dict[str, dict] = {}
+        # Per-scenario spread-gate snapshot used to colour scenario
+        # chips per row. Shape: {scenario_id: {symbol: {passed, ...}}}
+        self._scenario_spread_gates: dict[str, dict] = {}
+
         # Cumulative P&L over time: list of (timestamp, cumulative_pnl)
         self._pnl_history: list[tuple[float, float]] = []
         self._total_pnl: float = 0.0
 
-        # Recent trades (fills) — newest first
+        # Recent fills — raw stream, newest first. Drives the Trade Log
+        # text history.
         self._trades: deque[dict] = deque(maxlen=MAX_TRADE_LOG)
+        # Closed trades — pairs of opener+closer fills, with realised
+        # P&L computed from the price delta × qty. Newest first.
+        # Feeds the Recent Trades TABLE (distinct from the fills log).
+        # Dedup by (scenario_id, strategy_id, symbol, entry_ts) so a
+        # chaotic fan-out doesn't produce multiple rows for the same
+        # logical trade.
+        self._closed_trades: deque[dict] = deque(maxlen=MAX_TRADE_LOG)
+        self._closed_trade_keys: set = set()
 
         # Fill deduplication — see MAX_FILL_DEDUP comment above.
         self._seen_fills: deque[tuple[str, str]] = deque(maxlen=MAX_FILL_DEDUP)
@@ -96,9 +371,11 @@ class Dashboard:
         # Alert banner text (cleared after display)
         self._alert: str = ""
 
-        # Latest snapshot from an arbitrage scanner sidecar. None until
-        # the first `arb.scan` message arrives. The Arbitrage tab's timer
-        # reads this on every render tick.
+        # Latest snapshot from each arb scanner publisher, keyed by
+        # strategy_id ("arbitrage" = pre-match, "arbitrage_live" = live).
+        # The Arbitrage tab's timer renders rows from both, tagged "PM"/"LIVE".
+        # Kept as legacy `_arb_scan` for any old-tab code that reads it.
+        self._arb_scans: dict[str, dict] = {}
         self._arb_scan: Optional[dict] = None
 
         # Mode label (e.g. "live" / "paper") — updated from heartbeat.
@@ -124,6 +401,13 @@ class Dashboard:
 
     def run(self):
         """Build the web GUI, start ZMQ, and launch the NiceGUI server. Blocks."""
+        # Seed the trades deque + open-trades state from QuestDB BEFORE
+        # the ZMQ stream starts so the dashboard shows history the
+        # instant the page renders. Pre-existing open positions come
+        # back via the orchestrator's heartbeat anyway (it replays
+        # fills into each RiskManager on startup), but Recent Trades
+        # is GUI-local state so it needs its own seed.
+        self._seed_from_questdb()
         self._start_zmq()
         self._build_page()
 
@@ -134,6 +418,9 @@ class Dashboard:
             dark=True,
             reload=False,
             show=False,       # Don't auto-open browser (headless VPS friendly)
+            # Required by app.storage.user (cookie-identified server storage,
+            # used to remember the last-selected tab across page reloads).
+            storage_secret="zmqgui-local-dashboard",
         )
 
     # ------------------------------------------------------------------ #
@@ -212,8 +499,26 @@ class Dashboard:
                     if cfg.tabs.get("arb", True) else None
                 )
 
-            default_tab = console_tab or ftmo_tab or arb_tab
-            with ui.tab_panels(tabs, value=default_tab).classes("w-full").style(
+            # Restore the last-selected tab across page reloads via per-browser
+            # user storage. Falls back to the first enabled tab if the saved
+            # name is missing or points to a now-disabled tab.
+            enabled_tab_names = [
+                name for name, t in (
+                    ("Console", console_tab),
+                    ("FTMO MT5", ftmo_tab),
+                    ("Arbitrage", arb_tab),
+                ) if t is not None
+            ]
+            saved_tab = app.storage.user.get("active_tab")
+            initial_tab = (
+                saved_tab if saved_tab in enabled_tab_names
+                else (enabled_tab_names[0] if enabled_tab_names else None)
+            )
+            tabs.on_value_change(
+                lambda e: app.storage.user.update(active_tab=e.value)
+            )
+
+            with ui.tab_panels(tabs, value=initial_tab).classes("w-full").style(
                 f"background-color: {BG_DARK};"
             ):
 
@@ -256,17 +561,38 @@ class Dashboard:
                         </q-td>
                     """)
 
-                    # ---- Strategy table ----
+                    # ---- Scenario filter (pills above the strategy table) ----
+                    # Operator picks a scenario and the table filters to
+                    # strategies routed to it. "All" is the default +
+                    # shows the union. Membership from heartbeat's
+                    # scenario_strategies map.
+                    self._scenario_filter = "All"
+                    with ui.row().classes("mt-4").style("gap: 4px;"):
+                        ui.label("Scenario filter:").style(
+                            f"color: {TEXT_SECONDARY}; font-size: 12px; margin-right: 8px;"
+                        )
+                        self._scenario_filter_toggle = ui.toggle(
+                            options=["All"], value="All",
+                        ).props(
+                            f'dense color=primary toggle-color=primary'
+                        ).on_value_change(
+                            lambda e: setattr(self, "_scenario_filter", e.value)
+                        )
+
+                    # ---- Strategy table (one row per strategy, symbol) ----
                     columns = [
                         {"name": "strategy", "label": "Strategy", "field": "strategy", "align": "left"},
+                        {"name": "symbol", "label": "Symbol", "field": "symbol", "align": "left"},
                         {"name": "status", "label": "Status", "field": "status", "align": "center"},
-                        {"name": "pnl", "label": "P&L Today", "field": "pnl", "align": "right"},
-                        {"name": "trades", "label": "Trades", "field": "trades", "align": "center"},
-                        {"name": "win_pct", "label": "Win %", "field": "win_pct", "align": "center"},
+                        {"name": "scenarios", "label": "Scenarios", "field": "scenarios", "align": "left"},
+                        {"name": "spread", "label": "Spread (bps)", "field": "spread", "align": "right"},
                         {"name": "last_signal", "label": "Last Signal", "field": "last_signal", "align": "left"},
+                        # Conditions column: renders every entry condition
+                        # + filter state as coloured chips.
+                        {"name": "conditions", "label": "Conditions", "field": "conditions", "align": "left"},
                     ]
                     strat_table = ui.table(
-                        columns=columns, rows=[], row_key="strategy",
+                        columns=columns, rows=[], row_key="strategy_symbol",
                     ).classes("w-full").style(f"background-color: {BG_PANEL};")
                     strat_table.add_slot("body-cell-status", r"""
                         <q-td :props="props">
@@ -278,11 +604,70 @@ class Dashboard:
                             }">{{ props.row.status }}</span>
                         </q-td>
                     """)
-                    strat_table.add_slot("body-cell-pnl", r"""
-                        <q-td :props="props">
-                            <span :style="{
-                                color: props.row.pnl_raw >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""'
-                            }">{{ props.row.pnl }}</span>
+                    # Spread cell: renders one value per scenario data
+                    # source so operators see OANDA/Dukascopy side-by-side
+                    # for the same (strategy, symbol) row. Expected shape:
+                    # props.row.spread_chips = [{broker, bps, color}].
+                    # Fixed height matches the Conditions cell so rows
+                    # line up visually.
+                    strat_table.add_slot("body-cell-spread", r"""
+                        <q-td :props="props" style="vertical-align: top; padding: 4px 8px;">
+                            <div style="display: flex; flex-direction: column; gap: 2px; font-size: 11px; height: 120px; overflow-y: auto;">
+                                <span v-for="s in props.row.spread_chips"
+                                      :key="s.broker"
+                                      :style="{
+                                        color: s.color,
+                                        whiteSpace: 'nowrap',
+                                      }">{{ s.broker }}: {{ s.bps }}</span>
+                            </div>
+                        </q-td>
+                    """)
+                    # Scenarios cell: one pill per scenario this row
+                    # routes to. Pill colour reflects whether THAT
+                    # scenario's per-scenario spread gate would pass on
+                    # the current quote (green=pass, red=blocked,
+                    # grey=no gate or no quote yet). Hover the pill
+                    # for the gate details (data source, bps, threshold).
+                    # Fixed height to match adjacent chip cells.
+                    strat_table.add_slot("body-cell-scenarios", r"""
+                        <q-td :props="props" style="vertical-align: top; padding: 4px 8px;">
+                            <div style="display: flex; flex-wrap: wrap; gap: 3px; font-size: 10px; height: 120px; overflow-y: auto;">
+                                <span v-for="s in props.row.scenario_chips"
+                                      :key="s.id"
+                                      :title="s.title"
+                                      :style="{
+                                        color: s.color,
+                                        border: '1px solid ' + s.color,
+                                        borderRadius: '3px',
+                                        padding: '0px 4px',
+                                        whiteSpace: 'nowrap',
+                                        height: 'fit-content',
+                                      }">{{ s.id }}</span>
+                            </div>
+                        </q-td>
+                    """)
+                    # Conditions cell: each condition becomes a small
+                    # coloured span. `condition_chips` is an array of
+                    # {label, color} items that we render inline. Vue
+                    # v-for directly over props.row.condition_chips so
+                    # the DOM stays lightweight — one span per condition.
+                    # Fixed cell height + inner scroll keeps row height
+                    # stable across heartbeats even when one strategy
+                    # has 8 chips and another has 3.
+                    strat_table.add_slot("body-cell-conditions", r"""
+                        <q-td :props="props" style="vertical-align: top; padding: 4px 8px;">
+                            <div style="display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px; line-height: 1.4; height: 120px; overflow-y: auto;">
+                                <span v-for="chip in props.row.condition_chips"
+                                      :key="chip.label"
+                                      :style="{
+                                        color: chip.color,
+                                        border: '1px solid ' + chip.color,
+                                        borderRadius: '3px',
+                                        padding: '1px 5px',
+                                        whiteSpace: 'nowrap',
+                                        height: 'fit-content',
+                                      }">{{ chip.label }}</span>
+                            </div>
                         </q-td>
                     """)
 
@@ -290,15 +675,43 @@ class Dashboard:
                     ui.label("Open Trades").classes("mt-4").style(
                         f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
                     )
+                    # sortable=True on every column gives us click-to-sort
+                    # headers via Quasar's built-in QTable sort. Sort keys
+                    # need to be comparable — for numerics that means the
+                    # raw value (e.g. pnl_raw, move_pct_raw), for strings
+                    # the display value is fine. `sort` props are expressed
+                    # via :sort-method slot only when we need custom order;
+                    # Quasar default compares `field` lexically, which
+                    # works for our strings and ordered numeric formatting
+                    # (prices with consistent decimals). For P&L and
+                    # move%, we route the sort through the _raw numeric
+                    # field to avoid string-ordering "10 < 2" surprises.
                     ot_columns = [
-                        {"name": "strategy", "label": "Strategy", "field": "strategy", "align": "left"},
-                        {"name": "pair", "label": "Pair", "field": "pair", "align": "left"},
-                        {"name": "direction", "label": "Direction", "field": "direction", "align": "center"},
-                        {"name": "entry_price", "label": "Entry", "field": "entry_price", "align": "right"},
-                        {"name": "current_price", "label": "Current", "field": "current_price", "align": "right"},
-                        {"name": "stop_loss", "label": "SL", "field": "stop_loss", "align": "right"},
-                        {"name": "take_profit", "label": "TP", "field": "take_profit", "align": "right"},
-                        {"name": "timeout", "label": "Timeout", "field": "timeout", "align": "center"},
+                        {"name": "strategy", "label": "Strategy", "field": "strategy", "align": "left", "sortable": True},
+                        {"name": "pair", "label": "Pair", "field": "pair", "align": "left", "sortable": True},
+                        {"name": "direction", "label": "Direction", "field": "direction", "align": "center", "sortable": True},
+                        # Entry time is sortable numerically via the hidden
+                        # entry_time_raw field (epoch seconds) — display
+                        # shows HH:MM:SS, hover tooltip shows full date.
+                        {"name": "entry_time", "label": "Entry Time", "field": "entry_time", "align": "left", "sortable": True, "sort": "numeric"},
+                        {"name": "entry_price", "label": "Entry", "field": "entry_price", "align": "right", "sortable": True},
+                        {"name": "current_price", "label": "Current", "field": "current_price", "align": "right", "sortable": True},
+                        # Entry:Current as a percent move: ((current − entry) /
+                        # entry) × 100. Sign is the direction of the move,
+                        # NOT of P&L — a short in profit shows negative %
+                        # here (price dropped) but green in the P&L column.
+                        {"name": "move_pct", "label": "Move %", "field": "move_pct", "align": "right", "sortable": True, "sort": "numeric"},
+                        {"name": "stop_loss", "label": "SL", "field": "stop_loss", "align": "right", "sortable": True},
+                        {"name": "take_profit", "label": "TP", "field": "take_profit", "align": "right", "sortable": True},
+                        # Live unrealised P&L — price delta × qty − RT cost
+                        # estimate (2× opener commission). Colour-coded
+                        # green/red; updates on every tick via the UI timer.
+                        {"name": "pnl", "label": "P&L", "field": "pnl", "align": "right", "sortable": True},
+                        {"name": "timeout", "label": "Timeout", "field": "timeout", "align": "center", "sortable": True},
+                        # TradingView chart link per row — quickest way to
+                        # eyeball entry/TP/SL against current action
+                        # without cluttering the GUI with inline plots.
+                        {"name": "chart", "label": "Chart", "field": "chart", "align": "center"},
                     ]
                     ot_rows = [{
                         "key": "_empty",
@@ -307,10 +720,15 @@ class Dashboard:
                         "direction": "--",
                         "entry_price": "--",
                         "current_price": "--",
+                        "move_pct": "--",
+                        "move_pct_raw": 0.0,
                         "stop_loss": "--",
                         "take_profit": "--",
+                        "pnl": "--",
+                        "pnl_raw": 0.0,
                         "timeout": "--",
                         "pnl_positive": True,
+                        "chart_url": "",
                     }]
                     open_trades_table = ui.table(
                         columns=ot_columns, rows=ot_rows, row_key="key",
@@ -330,45 +748,133 @@ class Dashboard:
                             }">{{ props.row.current_price }}</span>
                         </q-td>
                     """)
+                    open_trades_table.add_slot("body-cell-pnl", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.pnl_raw > 0 ? '""" + GREEN + r"""'
+                                     : props.row.pnl_raw < 0 ? '""" + RED + r"""'
+                                     : '""" + TEXT_SECONDARY + r"""',
+                                fontWeight: 'bold'
+                            }">{{ props.row.pnl }}</span>
+                        </q-td>
+                    """)
+                    # Move % cell: colour tracks the P&L sign, not the
+                    # raw % sign. A short in profit shows a negative %
+                    # in green; a long in profit shows positive % in green.
+                    open_trades_table.add_slot("body-cell-move_pct", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.pnl_positive ? '""" + GREEN + r"""'
+                                     : '""" + RED + r"""',
+                            }">{{ props.row.move_pct }}</span>
+                        </q-td>
+                    """)
+                    # Chart cell: anchor to TradingView's chart with the
+                    # OANDA symbol prefilled. Opens in new tab so the
+                    # dashboard stays focused. Exchange prefix `OANDA:`
+                    # chosen because TradingView has the OANDA feed
+                    # default-available; falls back gracefully.
+                    open_trades_table.add_slot("body-cell-chart", r"""
+                        <q-td :props="props">
+                            <a v-if="props.row.chart_url"
+                               :href="props.row.chart_url"
+                               target="_blank"
+                               style="color: """ + BLUE + r""";
+                                      text-decoration: underline;">
+                                open ↗
+                            </a>
+                            <span v-else style="color: """ + TEXT_SECONDARY + r""";">--</span>
+                        </q-td>
+                    """)
 
-                    # ---- Bottom panel: chart (left) + trade log (right) ----
-                    with ui.row().classes("w-full gap-4 mt-4"):
-                        chart_fig = {
-                            "data": [{
-                                "x": [], "y": [],
-                                "type": "scatter", "mode": "lines",
-                                "line": {"color": PNL_LINE_COLOUR, "width": 2},
-                                "name": "Cumulative P&L",
-                            }],
-                            "layout": {
-                                "paper_bgcolor": BG_DARK,
-                                "plot_bgcolor": BG_PANEL,
-                                "font": {"color": TEXT_PRIMARY},
-                                "margin": {"l": 50, "r": 20, "t": 30, "b": 30},
-                                "xaxis": {"showticklabels": False, "gridcolor": "#32324a"},
-                                "yaxis": {"title": "P&L", "gridcolor": "#32324a"},
-                                "title": {"text": "Cumulative P&L", "font": {"size": 14}},
-                                "showlegend": False,
-                            },
-                        }
-                        pnl_chart = ui.plotly(chart_fig).classes("flex-grow").style(
-                            f"min-width: 500px; height: {CHART_HEIGHT + TRADE_LOG_HEIGHT}px;"
-                        )
+                    # ---- P&L chart (full width, top) ----
+                    chart_fig = {
+                        "data": [{
+                            "x": [], "y": [],
+                            "type": "scatter", "mode": "lines",
+                            "line": {"color": PNL_LINE_COLOUR, "width": 2},
+                            "name": "Cumulative P&L",
+                        }],
+                        "layout": {
+                            "paper_bgcolor": BG_DARK,
+                            "plot_bgcolor": BG_PANEL,
+                            "font": {"color": TEXT_PRIMARY},
+                            "margin": {"l": 50, "r": 20, "t": 30, "b": 30},
+                            "xaxis": {"showticklabels": False, "gridcolor": "#32324a"},
+                            "yaxis": {"title": "P&L", "gridcolor": "#32324a"},
+                            "title": {"text": "Cumulative P&L (trader activity only)", "font": {"size": 14}},
+                            "showlegend": False,
+                        },
+                    }
+                    pnl_chart = ui.plotly(chart_fig).classes("w-full mt-4").style(
+                        f"height: {CHART_HEIGHT}px;"
+                    )
 
-                        with ui.card().classes("flex-shrink-0").style(
-                            f"width: 380px; height: {CHART_HEIGHT + TRADE_LOG_HEIGHT}px; "
-                            f"background-color: {BG_PANEL}; overflow-y: auto;"
-                        ):
-                            ui.label("Recent Trades").style(
-                                f"color: {TEXT_SECONDARY}; font-weight: bold;"
-                            )
-                            trade_log = ui.label("Waiting for trades...").style(
-                                f"color: {TEXT_PRIMARY}; white-space: pre-wrap; "
-                                f"font-family: monospace; font-size: 13px;"
-                            )
+                    # ---- Past Trades table (full width, below chart) ----
+                    # Mirror of Open Trades but rows are CLOSED trades
+                    # with realised P&L. Populated from live fills that
+                    # net against existing positions AND seeded on
+                    # startup from QuestDB history.
+                    ui.label("Past Trades").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    # SL/TP columns show the original opener-side levels
+                    # so the operator can eyeball at a glance whether the
+                    # exit price matches the SL/TP or was a strategy-
+                    # initiated close. For timeout/strategy exits SL and
+                    # TP are still displayed — they're the targets the
+                    # trade NEVER hit.
+                    rt_columns = [
+                        {"name": "strategy", "label": "Strategy", "field": "strategy", "align": "left", "sortable": True},
+                        {"name": "pair", "label": "Pair", "field": "pair", "align": "left", "sortable": True},
+                        {"name": "direction", "label": "Direction", "field": "direction", "align": "center", "sortable": True},
+                        {"name": "entry_time", "label": "Entry Time", "field": "entry_time", "align": "left", "sortable": True, "sort": "numeric"},
+                        {"name": "entry_price", "label": "Entry", "field": "entry_price", "align": "right", "sortable": True},
+                        {"name": "stop_loss", "label": "SL", "field": "stop_loss", "align": "right", "sortable": True},
+                        {"name": "take_profit", "label": "TP", "field": "take_profit", "align": "right", "sortable": True},
+                        {"name": "exit_time", "label": "Exit Time", "field": "exit_time", "align": "left", "sortable": True, "sort": "numeric"},
+                        {"name": "exit_price", "label": "Exit", "field": "exit_price", "align": "right", "sortable": True},
+                        {"name": "pnl_pct", "label": "P&L %", "field": "pnl_pct", "align": "right", "sortable": True, "sort": "numeric"},
+                        {"name": "pnl", "label": "P&L", "field": "pnl", "align": "right", "sortable": True, "sort": "numeric"},
+                    ]
+                    recent_trades_table = ui.table(
+                        columns=rt_columns, rows=[], row_key="key",
+                    ).classes("w-full").style(f"background-color: {BG_PANEL};")
+                    recent_trades_table.add_slot("body-cell-direction", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.direction === 'BUY' ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'bold'
+                            }">{{ props.row.direction }}</span>
+                        </q-td>
+                    """)
+                    recent_trades_table.add_slot("body-cell-pnl", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.pnl_raw > 0 ? '""" + GREEN + r"""'
+                                     : props.row.pnl_raw < 0 ? '""" + RED + r"""'
+                                     : '""" + TEXT_SECONDARY + r"""',
+                                fontWeight: 'bold'
+                            }">{{ props.row.pnl }}</span>
+                        </q-td>
+                    """)
+                    recent_trades_table.add_slot("body-cell-pnl_pct", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.pnl_raw > 0 ? '""" + GREEN + r"""'
+                                     : props.row.pnl_raw < 0 ? '""" + RED + r"""'
+                                     : '""" + TEXT_SECONDARY + r"""',
+                            }">{{ props.row.pnl_pct }}</span>
+                        </q-td>
+                    """)
+
+                    # Legacy `trade_log` label retired — the table above
+                    # replaces it. Keep the variable so the update path
+                    # doesn't break; None means "no text label to write".
+                    trade_log = None
               else:
                   scen_table = strat_table = open_trades_table = None
-                  pnl_chart = trade_log = None
+                  pnl_chart = trade_log = recent_trades_table = None
                   chart_fig = None
 
               # ================ FTMO MT5 TAB ================
@@ -545,29 +1051,107 @@ class Dashboard:
                         arb_summary_label = ui.label("").style(f"color: {TEXT_SECONDARY};")
                         arb_pnl_label = ui.label("").style(f"color: {TEXT_SECONDARY};")
 
-                    ui.label("Profitable Opportunities").classes("mt-4").style(
-                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    # ===== HERO: Profitable Arbs =====
+                    # The point of this whole tab. Sortable by P&L (default)
+                    # or by Age so newly-opened arbs jump to the top.
+                    ui.label("⭐ Profitable Arbs (taking these would make money now)").classes("mt-2").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 18px;"
                     )
                     arb_opp_columns = [
-                        {"name": "sport",      "label": "Sport",      "field": "sport",      "align": "left"},
-                        {"name": "event",      "label": "Event",      "field": "event",      "align": "left"},
-                        {"name": "market",     "label": "Market",     "field": "market",     "align": "left"},
-                        {"name": "selection",  "label": "Selection",  "field": "selection",  "align": "left"},
-                        {"name": "back",       "label": "Back @ Px",  "field": "back",       "align": "right"},
-                        {"name": "lay",        "label": "Lay @ Px",   "field": "lay",        "align": "right"},
-                        {"name": "net_margin", "label": "Net %",      "field": "net_margin", "align": "right"},
-                        {"name": "pnl",        "label": "Sim P&L (£)","field": "pnl",        "align": "right"},
-                        {"name": "confidence", "label": "Match %",    "field": "confidence", "align": "center"},
+                        {"name": "fresh",      "label": "",           "field": "fresh",      "align": "center", "sortable": True},
+                        # Mode = PM (pre-match, port 5562) or LIVE (in-play, 5563)
+                        {"name": "mode",       "label": "Mode",       "field": "mode",       "align": "center", "sortable": True},
+                        {"name": "sport",      "label": "Sport",      "field": "sport",      "align": "left",   "sortable": True},
+                        {"name": "event",      "label": "Fixture",    "field": "event",      "align": "left",   "sortable": True},
+                        {"name": "market",     "label": "Market",     "field": "market",     "align": "left",   "sortable": True},
+                        {"name": "selection",  "label": "Selection",  "field": "selection",  "align": "left",   "sortable": True},
+                        # "Back" and "Lay" show the LOCKED odds + size from
+                        # first detection — what we'd have clipped acting then.
+                        {"name": "back",       "label": "Back",       "field": "back",       "align": "right",  "sortable": False},
+                        {"name": "lay",        "label": "Lay",        "field": "lay",        "align": "right",  "sortable": False},
+                        {"name": "stake",      "label": "Stake",      "field": "stake_num",  "align": "right",  "sortable": True},
+                        # "Capital" = stake + lay liability — the actual
+                        # money you'd need to deploy across both exchanges
+                        # to take this arb. Stake alone hides the lay
+                        # liability that funds the other leg, so high-odds
+                        # arbs look cheap until you sort by Capital.
+                        {"name": "capital",    "label": "Capital £",  "field": "capital_num","align": "right",  "sortable": True},
+                        # Net % is already pnl / Capital (ROC). High Net %
+                        # + low Capital = ideal. High Net % + huge Capital
+                        # = the trap (4% on £130 = £5 ties up most of bank).
+                        {"name": "net_margin", "label": "Net %",      "field": "net_num",    "align": "right",  "sortable": True},
+                        {"name": "pnl",        "label": "Sim P/L",    "field": "pnl_num",    "align": "right",  "sortable": True},
+                        # "Live" shows how the arb has drifted since detection:
+                        # +£1.20 = improved, −£3.40 = slippage. Lets the user
+                        # see at a glance whether the headline number is still
+                        # available or if they missed the window.
+                        {"name": "live",       "label": "Drift £",    "field": "drift_num",  "align": "right",  "sortable": True},
+                        {"name": "age",        "label": "Age",        "field": "age_num",    "align": "right",  "sortable": True},
+                        {"name": "confidence", "label": "Match %",    "field": "confidence", "align": "center", "sortable": True},
                     ]
                     arb_opp_table = ui.table(
-                        columns=arb_opp_columns, rows=[], row_key="event",
+                        columns=arb_opp_columns, rows=[],
+                        row_key="opp_key",
+                        pagination={"rowsPerPage": 25, "sortBy": "pnl", "descending": True},
                     ).classes("w-full").style(f"background-color: {BG_PANEL};")
+
+                    # NEW badge — green pill for is_new, dim for older
+                    arb_opp_table.add_slot("body-cell-fresh", r"""
+                        <q-td :props="props">
+                            <span v-if="props.row.is_new" :style="{
+                                color: 'white', backgroundColor: '""" + GREEN + r"""',
+                                padding: '2px 8px', borderRadius: '10px',
+                                fontSize: '11px', fontWeight: 'bold'
+                            }">NEW</span>
+                            <span v-else :style="{
+                                color: '""" + TEXT_SECONDARY + r"""',
+                                fontSize: '11px'
+                            }">{{ '×' + props.row.consecutive }}</span>
+                        </q-td>
+                    """)
+                    # P/L coloured + signed
                     arb_opp_table.add_slot("body-cell-pnl", r"""
                         <q-td :props="props">
                             <span :style="{
-                                color: props.row.pnl_raw >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                color: props.row.pnl_num >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
                                 fontWeight: 'bold'
-                            }">{{ props.row.pnl }}</span>
+                            }">{{ '£' + (props.row.pnl_num >= 0 ? '+' : '') + props.row.pnl_num.toFixed(2) }}</span>
+                        </q-td>
+                    """)
+                    arb_opp_table.add_slot("body-cell-net_margin", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.net_num >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'bold'
+                            }">{{ (props.row.net_num >= 0 ? '+' : '') + props.row.net_num.toFixed(2) + '%' }}</span>
+                        </q-td>
+                    """)
+                    arb_opp_table.add_slot("body-cell-capital", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.capital_num > 100 ? '""" + RED + r"""' :
+                                       props.row.capital_num > 30  ? '""" + YELLOW + r"""' :
+                                                                      '""" + TEXT_PRIMARY + r"""',
+                                fontWeight: 'bold'
+                            }">£{{ props.row.capital_num.toFixed(0) }}</span>
+                        </q-td>
+                    """)
+                    arb_opp_table.add_slot("body-cell-stake", r"""
+                        <q-td :props="props">£{{ props.row.stake_num.toFixed(2) }}</q-td>
+                    """)
+                    arb_opp_table.add_slot("body-cell-age", r"""
+                        <q-td :props="props">{{ props.row.age_num < 60 ? props.row.age_num.toFixed(0) + 's' : (props.row.age_num / 60).toFixed(1) + 'm' }}</q-td>
+                    """)
+                    # Drift coloured: positive = arb improved, negative = slippage
+                    arb_opp_table.add_slot("body-cell-live", r"""
+                        <q-td :props="props">
+                            <span v-if="props.row.drift_num === null || props.row.drift_num === 0" :style="{
+                                color: '""" + TEXT_SECONDARY + r"""'
+                            }">—</span>
+                            <span v-else :style="{
+                                color: props.row.drift_num >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'normal', fontSize: '12px'
+                            }">{{ (props.row.drift_num >= 0 ? '+' : '') + props.row.drift_num.toFixed(2) }}</span>
                         </q-td>
                     """)
 
@@ -585,6 +1169,26 @@ class Dashboard:
                         with ui.card().style(
                             f"width: 320px; min-height: 220px; background-color: {BG_PANEL};"
                         ):
+                            ui.label("Cost Model").style(
+                                f"color: {TEXT_SECONDARY}; font-weight: bold;"
+                            )
+                            arb_costs_label = ui.label("").style(
+                                f"color: {TEXT_PRIMARY}; white-space: pre-wrap; "
+                                f"font-family: monospace; font-size: 13px;"
+                            )
+                        with ui.card().style(
+                            f"width: 320px; min-height: 220px; background-color: {BG_PANEL};"
+                        ):
+                            ui.label("Coverage").style(
+                                f"color: {TEXT_SECONDARY}; font-weight: bold;"
+                            )
+                            arb_coverage_label = ui.label("").style(
+                                f"color: {TEXT_PRIMARY}; white-space: pre-wrap; "
+                                f"font-family: monospace; font-size: 13px;"
+                            )
+                        with ui.card().style(
+                            f"width: 320px; min-height: 220px; background-color: {BG_PANEL};"
+                        ):
                             ui.label("Configuration").style(
                                 f"color: {TEXT_SECONDARY}; font-weight: bold;"
                             )
@@ -596,26 +1200,71 @@ class Dashboard:
                     def update_arb():
                         with dashboard._lock:
                             snap = dashboard._arb_scan
+                            scans = dict(dashboard._arb_scans)
+                            strategies = {
+                                k: dict(v) for k, v in dashboard._strategies.items()
+                            }
+
+                        # Detect MB lockout from either publisher's heartbeat —
+                        # status="errored" + activity mentions "lockout".
+                        # Show prominently because the user can't act on stale
+                        # data and needs to know recovery is automatic.
+                        lockout_msgs = []
+                        for sid in ("arbitrage", "arbitrage_live"):
+                            info = strategies.get(sid) or {}
+                            act = info.get("activity", "")
+                            if (info.get("status") == "errored"
+                                    and "lockout" in act.lower()):
+                                tag = "PM" if sid == "arbitrage" else "LIVE"
+                                lockout_msgs.append(f"{tag}: {act}")
+
                         try:
-                            with open(os.path.expanduser(cfg.arb.config_path)) as _f:
+                            cfg_path = os.path.expanduser(cfg.arb.config_path)
+                            with open(cfg_path) as _f:
                                 _cfg = json.load(_f).get("scan", {})
-                            sports = ", ".join(s["name"] for s in _cfg.get("sports", []))
+                            # Sports moved out of config.json into per-sport
+                            # YAML files in sports/ alongside the repo, so we
+                            # discover them by directory listing now.
+                            sports_dir = os.path.join(
+                                os.path.dirname(cfg_path),
+                                _cfg.get("sports_dir", "sports"),
+                            )
+                            try:
+                                sport_files = sorted(
+                                    f[:-4] for f in os.listdir(sports_dir)
+                                    if f.endswith(".yml") or f.endswith(".yaml")
+                                )
+                                sports = ", ".join(sport_files) or "(none)"
+                            except Exception:
+                                sports = "(sports dir not found)"
                             arb_config_label.set_text(
-                                f"Sports:      {sports}\n"
-                                f"Stake:       £{_cfg.get('stake', '?')}\n"
-                                f"Min margin:  {_cfg.get('min_margin', 0) * 100:.1f}%\n"
-                                f"Price depth: {_cfg.get('price_depth', '?')} levels\n"
+                                f"Sports:        {sports}\n"
+                                f"Stake:         £{_cfg.get('stake', '?')}\n"
+                                f"Min margin:    {_cfg.get('min_margin', 0) * 100:.1f}%\n"
+                                f"Min liquidity: £{_cfg.get('min_liquidity', '?')}\n"
+                                f"Price depth:   {_cfg.get('price_depth', '?')} levels\n"
                             )
                         except Exception:
                             arb_config_label.set_text("(config not readable)")
 
-                        if snap is None:
+                        # If a publisher is in MB lockout, surface it loudly
+                        # at the top — overrides the generic "no opps" status.
+                        if lockout_msgs:
                             arb_status_label.set_text(
-                                "Arb Scanner: waiting for first scan…"
+                                "🚧 Matchbook Lockout — " + " | ".join(lockout_msgs)
                             )
                             arb_status_label.style(
-                                replace=f"color: {YELLOW}; font-weight: bold;"
+                                replace=f"color: {RED}; font-weight: bold;"
                             )
+
+                        if snap is None:
+                            if not lockout_msgs:
+                                arb_status_label.set_text(
+                                    "Arb Scanner: waiting for first scan…"
+                                )
+                                arb_status_label.style(
+                                    replace=f"color: {YELLOW}; font-weight: bold;"
+                                )
                             arb_summary_label.set_text("")
                             arb_pnl_label.set_text("")
                             arb_opp_table.rows = []
@@ -623,21 +1272,26 @@ class Dashboard:
                             arb_stats_label.set_text("waiting…")
                             return
 
-                        age = time.time() - snap.get("scan_completed_at", 0)
-                        if age > 300:
-                            col = RED
-                            status_text = f"Arb Scanner: STALE (last scan {age:.0f}s ago)"
-                        elif snap.get("profitable_count", 0) > 0:
-                            col = GREEN
-                            status_text = (
-                                f"Arb Scanner: ACTIVE — "
-                                f"{snap['profitable_count']} profitable opps"
-                            )
+                        # Skip the generic status text when lockout already
+                        # took the label — lockout is the more important signal.
+                        if not lockout_msgs:
+                            age = time.time() - snap.get("scan_completed_at", 0)
+                            if age > 300:
+                                col = RED
+                                status_text = f"Arb Scanner: STALE (last scan {age:.0f}s ago)"
+                            elif snap.get("profitable_count", 0) > 0:
+                                col = GREEN
+                                status_text = (
+                                    f"Arb Scanner: ACTIVE — "
+                                    f"{snap['profitable_count']} profitable opps"
+                                )
+                            else:
+                                col = YELLOW
+                                status_text = "Arb Scanner: ACTIVE — no opps right now"
+                            arb_status_label.set_text(status_text)
+                            arb_status_label.style(replace=f"color: {col}; font-weight: bold;")
                         else:
-                            col = YELLOW
-                            status_text = "Arb Scanner: ACTIVE — no opps right now"
-                        arb_status_label.set_text(status_text)
-                        arb_status_label.style(replace=f"color: {col}; font-weight: bold;")
+                            age = time.time() - snap.get("scan_completed_at", 0)
                         arb_summary_label.set_text(
                             f"{snap.get('matched_pairs', 0)} matched pairs from "
                             f"{snap.get('matchbook_events', 0)} MB / "
@@ -650,31 +1304,63 @@ class Dashboard:
                         arb_pnl_label.set_text(f"Total sim P&L: £{pnl:+.2f}")
                         arb_pnl_label.style(replace=f"color: {pnl_col}; font-weight: bold;")
 
+                        # Merge opportunities from BOTH publishers (PM + LIVE)
+                        # so the table shows everything in one place. Each row
+                        # carries a Mode tag so users see at a glance which
+                        # publisher surfaced it (and therefore which book to
+                        # check for fillability).
                         rows = []
-                        for opp in snap.get("opportunities", []):
-                            if opp.get("net_margin", 0) <= 0:
-                                continue
-                            rows.append({
-                                "sport": opp.get("sport", "").title(),
-                                "event": opp.get("event", ""),
-                                "market": opp.get("market", ""),
-                                "selection": opp.get("selection", ""),
-                                "back": (
-                                    f"{opp.get('back_odds', 0):.2f} "
-                                    f"({opp.get('back_exchange', '')[:2].upper()})"
-                                ),
-                                "lay": (
-                                    f"{opp.get('lay_odds', 0):.2f} "
-                                    f"({opp.get('lay_exchange', '')[:2].upper()})"
-                                ),
-                                "net_margin": f"{opp.get('net_margin', 0) * 100:+.2f}%",
-                                "pnl": f"£{opp.get('simulated_pnl', 0):+.2f}",
-                                "pnl_raw": opp.get("simulated_pnl", 0),
-                                "confidence": f"{opp.get('match_confidence', 0):.0f}",
-                            })
+                        for sid_pub, snap_pub in scans.items():
+                            mode_tag = "LIVE" if sid_pub == "arbitrage_live" else "PM"
+                            for opp in snap_pub.get("opportunities", []):
+                                if opp.get("net_margin", 0) <= 0:
+                                    continue
+                                rows.append({
+                                    "opp_key": (
+                                        f"{mode_tag}|{opp.get('event','')}|{opp.get('market','')}|"
+                                        f"{opp.get('selection','')}|"
+                                        f"{opp.get('back_exchange','')}|{opp.get('lay_exchange','')}"
+                                    ),
+                                    "mode": mode_tag,
+                                    "is_new": opp.get("is_new", False),
+                                    "consecutive": opp.get("consecutive_scans", 1),
+                                    "sport": opp.get("sport", "").title(),
+                                    "event": opp.get("event", ""),
+                                    "market": opp.get("market", ""),
+                                    "selection": opp.get("selection", ""),
+                                    "back": (
+                                        f"{opp.get('back_exchange','')[:2].upper()} "
+                                        f"{opp.get('back_odds', 0):.2f} "
+                                        f"(£{opp.get('back_size', 0):,.0f})"
+                                    ),
+                                    "lay": (
+                                        f"{opp.get('lay_exchange','')[:2].upper()} "
+                                        f"{opp.get('lay_odds', 0):.2f} "
+                                        f"(£{opp.get('lay_size', 0):,.0f})"
+                                    ),
+                                    # Show BACK-LEG stake only (not back+lay_stake).
+                                    # Back leg is what you front on the back
+                                    # exchange; matches the back_size column
+                                    # (available back liquidity). Lay stake
+                                    # isn't "your money" — it's what the
+                                    # counterparty puts up. What YOU put up
+                                    # on the lay side is the LIABILITY, which
+                                    # is rolled into the Capital column.
+                                    "stake_num": opp.get("simulated_stake_back",
+                                                         opp.get("simulated_stake", 0)),
+                                    "capital_num": opp.get("capital_required", 0),
+                                    "net_num":   round(opp.get("net_margin", 0) * 100, 2),
+                                    "pnl_num":   round(opp.get("simulated_pnl", 0), 2),
+                                    # Drift = current_pnl − locked_pnl. Positive
+                                    # if odds moved in our favour since detection.
+                                    "drift_num": round(opp.get("pnl_slippage", 0), 2),
+                                    "age_num":   round(opp.get("age_seconds", 0), 0),
+                                    "confidence": f"{opp.get('match_confidence', 0):.0f}",
+                                })
                         arb_opp_table.rows = rows
                         arb_opp_table.update()
 
+                        n_new = snap.get("new_opportunity_count", 0)
                         arb_stats_label.set_text(
                             f"Last completed:    {time.strftime('%H:%M:%S', time.localtime(snap.get('scan_completed_at', 0)))}\n"
                             f"Scan duration:     {snap.get('duration_secs', 0):.1f}s\n"
@@ -682,12 +1368,384 @@ class Dashboard:
                             f"Betfair events:    {snap.get('betfair_events', 0)}\n"
                             f"Matched pairs:     {snap.get('matched_pairs', 0)}\n"
                             f"All opportunities: {snap.get('opportunities_count', 0)}\n"
-                            f"Profitable:        {snap.get('profitable_count', 0)}\n"
+                            f"Profitable:        {snap.get('profitable_count', 0)}  ({n_new} new)\n"
                             f"Best net margin:   {snap.get('best_margin', 0) * 100:+.2f}%\n"
                             f"Total sim P&L:     £{pnl:+.2f}"
                         )
 
+                        # Cost Model card — proves what's baked into P&L numbers
+                        cm = snap.get("cost_model", {}) or {}
+                        bf_rates = cm.get("betfair_rates_seen_this_scan", [])
+                        bf_range = (
+                            f"{min(bf_rates)*100:.1f}-{max(bf_rates)*100:.1f}%"
+                            if bf_rates else "(none used)"
+                        )
+                        arb_costs_label.set_text(
+                            f"Matchbook:    {cm.get('matchbook_commission_rate', 0)*100:.2f}% taker\n"
+                            f"  → both winning AND losing sides\n"
+                            f"Betfair:      5.0% default\n"
+                            f"  → on net winnings only\n"
+                            f"  → per-market rate via market_base_rate\n"
+                            f"  → range this scan: {bf_range}\n"
+                            f"\nStake config: £{cm.get('configured_stake_gbp', 0):.0f}\n"
+                            f"Min margin:   {cm.get('min_margin_threshold', 0)*100:.1f}%\n"
+                            f"Min liq:      £{cm.get('min_liquidity_threshold_gbp', 0)}"
+                        )
+
+                        # Coverage card — answers "what did we even look at?"
+                        cov = snap.get("coverage", {}) or {}
+                        per_sport = cov.get("sports_with_events", [])
+                        lines = [
+                            f"{s['sport']:<14}{s['matchbook']:>4} MB  {s['betfair']:>4} BF"
+                            for s in per_sport
+                        ]
+                        yield_pct = cov.get("matched_pair_yield_pct", 0)
+                        arb_coverage_label.set_text(
+                            "\n".join(lines) +
+                            f"\n\nMatched: {cov.get('matched_pair_count', 0)}"
+                            f"  ({yield_pct}% of MB)"
+                        )
+
+                    # ===== DIAGNOSTICS — dig in to what's NOT working =====
+                    ui.separator().classes("mt-6 mb-2")
+                    ui.label("🔍 Diagnostics — every matched market we considered").style(
+                        f"color: {TEXT_SECONDARY}; font-size: 14px; font-style: italic;"
+                    )
+
+                    # ---- Matched Pairs table ---------------------------------
+                    # One row per matched bet (sport / fixture+selection /
+                    # back odds + size on each exchange). Lets you eyeball the
+                    # cross-exchange spread on every comparable selection in
+                    # the slate without having to dig into the raw payload.
+                    ui.label("All Matched Markets (no arb on these — see Back/Lay spread)").classes("mt-2").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;"
+                    )
+                    # Columns are sortable by default in NiceGUI tables; numeric
+                    # fields (delta_pct_num, pnl_num) sort numerically while
+                    # display columns render the formatted strings via body
+                    # slots so colour coding works without breaking sort.
+                    arb_match_columns = [
+                        {"name": "mode",      "label": "Mode",      "field": "mode",      "align": "center", "sortable": True},
+                        {"name": "sport",     "label": "Sport",     "field": "sport",     "align": "left",   "sortable": True},
+                        {"name": "bet",       "label": "Bet",       "field": "bet",       "align": "left",   "sortable": True},
+                        {"name": "back",      "label": "Back",      "field": "back",      "align": "right",  "sortable": True},
+                        {"name": "lay",       "label": "Lay",       "field": "lay",       "align": "right",  "sortable": True},
+                        {"name": "stakes",    "label": "Stake B/L", "field": "stakes",    "align": "right",  "sortable": False},
+                        {"name": "delta_pct", "label": "Delta",     "field": "delta_num", "align": "right",  "sortable": True},
+                        {"name": "pnl",       "label": "Sim P/L",   "field": "pnl_num",   "align": "right",  "sortable": True},
+                        # Staleness = magnitude of one-side-moved-other-didn't.
+                        # Higher = arb just opened due to one book lagging.
+                        {"name": "stale",     "label": "Stale",     "field": "stale_num", "align": "right",  "sortable": True},
+                    ]
+                    arb_match_table = ui.table(
+                        columns=arb_match_columns, rows=[], row_key="bet_key",
+                        pagination={"rowsPerPage": 25, "sortBy": "pnl", "descending": True},
+                    ).classes("w-full").style(f"background-color: {BG_PANEL};")
+
+                    # Body slots: delta and pnl render with sign + colour but
+                    # the underlying field is the raw number so sort behaves.
+                    arb_match_table.add_slot("body-cell-delta_pct", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.delta_num >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'bold'
+                            }">{{ (props.row.delta_num >= 0 ? '+' : '') + props.row.delta_num.toFixed(2) + '%' }}</span>
+                        </q-td>
+                    """)
+                    arb_match_table.add_slot("body-cell-pnl", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.pnl_num >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'bold'
+                            }">{{ '£' + (props.row.pnl_num >= 0 ? '+' : '') + props.row.pnl_num.toFixed(2) }}</span>
+                        </q-td>
+                    """)
+
+                    def _exch_short(name: str) -> str:
+                        # Two-letter prefix for compact cell display.
+                        return (name or "")[:2].upper()
+
+                    def update_matches():
+                        with dashboard._lock:
+                            scans = dict(dashboard._arb_scans)
+                        if not scans:
+                            arb_match_table.rows = []
+                            arb_match_table.update()
+                            return
+                        rows = []
+                        for sid_pub, snap_pub in scans.items():
+                            mode_tag = "LIVE" if sid_pub == "arbitrage_live" else "PM"
+                            for m in snap_pub.get("matches", []):
+                                sport = (m.get("sport") or "").title()
+                                fixture = m.get("fixture", "")
+                                market = m.get("headline_market") or ""
+                                for sel in m.get("arb_rows", []):
+                                    # Each row is one comparable arb position:
+                                    # back on one exchange, lay on the other,
+                                    # stakes scaled to balance outcomes.
+                                    back_cell = (
+                                        f"{_exch_short(sel['back_exchange'])} "
+                                        f"{sel['back_odds']:.2f} "
+                                        f"(£{sel['back_size']:,.0f})"
+                                    )
+                                    lay_cell = (
+                                        f"{_exch_short(sel['lay_exchange'])} "
+                                        f"{sel['lay_odds']:.2f} "
+                                        f"(£{sel['lay_size']:,.0f})"
+                                    )
+                                    stale = sel.get("staleness")
+                                    rows.append({
+                                        "bet_key":   f"{mode_tag}|{fixture}|{market}|{sel['selection']}|{sel['direction']}",
+                                        "mode":      mode_tag,
+                                        "sport":     sport,
+                                        "bet":       f"{fixture} — {sel['selection']}",
+                                        "back":      back_cell,
+                                        "lay":       lay_cell,
+                                        "stakes":    f"£{sel['stake_back']:.0f} / £{sel['stake_lay']:.2f}",
+                                        "delta_num": round(sel["gross_margin"] * 100, 2),
+                                        "pnl_num":   round(sel["sim_pnl"], 2),
+                                        "stale_num": round(stale, 3) if stale is not None else None,
+                                    })
+                        arb_match_table.rows = rows
+                        arb_match_table.update()
+
+                    # ---- Dutch (cross-selection) arbs panel ------------------
+                    # Each row = a complete dutching position across all
+                    # selections of one market, where backing every outcome
+                    # on best-of-MB-vs-BF returns a guaranteed profit.
+                    # Distinct from same-selection back/lay; doesn't need
+                    # any laying at all.
+                    ui.label("Dutch Arbs (cross-selection back-back — separate from same-selection back/lay)").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;"
+                    )
+                    arb_dutch_columns = [
+                        {"name": "mode",       "label": "Mode",       "field": "mode",       "align": "center", "sortable": True},
+                        {"name": "sport",      "label": "Sport",      "field": "sport",      "align": "left",  "sortable": True},
+                        {"name": "fixture",    "label": "Fixture",    "field": "fixture",    "align": "left",  "sortable": True},
+                        {"name": "market",     "label": "Market",     "field": "market",     "align": "left",  "sortable": True},
+                        {"name": "legs",       "label": "Legs",       "field": "legs",       "align": "left",  "sortable": False},
+                        {"name": "overround",  "label": "Overround",  "field": "overround_num", "align": "right", "sortable": True},
+                        {"name": "min_pnl",    "label": "Min P/L (£)", "field": "min_pnl_num", "align": "right", "sortable": True},
+                        {"name": "size_ok",    "label": "Fillable",   "field": "size_ok",    "align": "center", "sortable": True},
+                    ]
+                    arb_dutch_table = ui.table(
+                        columns=arb_dutch_columns, rows=[], row_key="dutch_key",
+                        pagination={"rowsPerPage": 25, "sortBy": "min_pnl", "descending": True},
+                    ).classes("w-full").style(f"background-color: {BG_PANEL};")
+
+                    arb_dutch_table.add_slot("body-cell-overround", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.overround_num < 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'bold'
+                            }">{{ (props.row.overround_num >= 0 ? '+' : '') + (props.row.overround_num * 100).toFixed(2) + '%' }}</span>
+                        </q-td>
+                    """)
+                    arb_dutch_table.add_slot("body-cell-min_pnl", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.min_pnl_num >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'bold'
+                            }">{{ '£' + (props.row.min_pnl_num >= 0 ? '+' : '') + props.row.min_pnl_num.toFixed(2) }}</span>
+                        </q-td>
+                    """)
+
+                    def update_dutch():
+                        with dashboard._lock:
+                            scans = dict(dashboard._arb_scans)
+                        if not scans:
+                            arb_dutch_table.rows = []
+                            arb_dutch_table.update()
+                            return
+                        rows = []
+                        for sid_pub, snap_pub in scans.items():
+                            mode_tag = "LIVE" if sid_pub == "arbitrage_live" else "PM"
+                            for d in snap_pub.get("dutch_arbs", []):
+                                # Compact "leg1 (BF 2.10) | leg2 (MB 2.08) | …"
+                                legs = " | ".join(
+                                    f"{leg['selection']} ({leg['back_exchange'][:2].upper()} "
+                                    f"{leg['back_odds']:.2f})"
+                                    for leg in (d.get("legs") or [])
+                                )
+                                rows.append({
+                                    "dutch_key":     f"{mode_tag}|{d.get('fixture')}|{d.get('market_type')}|{d.get('market_name')}",
+                                    "mode":          mode_tag,
+                                    "sport":         (d.get("sport") or "").title(),
+                                    "fixture":       d.get("fixture", ""),
+                                    "market":        f"{d.get('market_type','')} ({d.get('market_name','')})",
+                                    "legs":          legs,
+                                    "overround_num": d.get("implied_overround", 0),
+                                    "min_pnl_num":   d.get("min_pnl", 0),
+                                    "size_ok":       "no" if d.get("size_constrained") else "yes",
+                                })
+                        arb_dutch_table.rows = rows
+                        arb_dutch_table.update()
+
+                    # ---- Trade Ledger ---------------------------------------
+                    # Live tail of executor/live_trades.jsonl from the
+                    # publisher — every fire decision (auto_fire AND manual
+                    # fire CLI). Lets the user see at a glance what would
+                    # have transmitted in dry-run mode and why anything
+                    # got rejected.
+                    ui.label("📒 Trade Ledger (last 50 fires — dry-run + live)").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;"
+                    )
+                    arb_trade_columns = [
+                        {"name": "time",      "label": "Time",       "field": "time",      "align": "center", "sortable": True},
+                        {"name": "status",    "label": "Status",     "field": "status",    "align": "center", "sortable": True},
+                        {"name": "sport",     "label": "Sport",      "field": "sport",     "align": "left",   "sortable": True},
+                        {"name": "fixture",   "label": "Fixture",    "field": "fixture",   "align": "left",   "sortable": True},
+                        {"name": "selection", "label": "Selection",  "field": "selection", "align": "left",   "sortable": True},
+                        {"name": "back_leg",  "label": "Back",       "field": "back_leg",  "align": "right",  "sortable": False},
+                        {"name": "lay_leg",   "label": "Lay",        "field": "lay_leg",   "align": "right",  "sortable": False},
+                        {"name": "stake",     "label": "Stake £",    "field": "stake_num", "align": "right",  "sortable": True},
+                        {"name": "liab",      "label": "Liab £",     "field": "liab_num",  "align": "right",  "sortable": True},
+                        # Capital = stake + liability (back/lay) or
+                        # total_stake (dutch). Mirrors the Profitable Arbs
+                        # column so users see the £ each fired trade tied up.
+                        {"name": "capital",   "label": "Capital £",  "field": "capital_num","align": "right",  "sortable": True},
+                        # Net % at the placed stake — same metric as the
+                        # Profitable Arbs Net % column. Tells you whether
+                        # the auto-sized fire still made sense at this size.
+                        {"name": "net_pct",   "label": "Net %",      "field": "net_num",   "align": "right",  "sortable": True},
+                        {"name": "exp_pnl",   "label": "Exp P/L",    "field": "exp_num",   "align": "right",  "sortable": True},
+                        {"name": "real_pnl",  "label": "Real P/L",   "field": "real_num",  "align": "right",  "sortable": True},
+                        {"name": "note",      "label": "Note",       "field": "note",      "align": "left",   "sortable": False},
+                    ]
+                    arb_trade_table = ui.table(
+                        columns=arb_trade_columns, rows=[],
+                        row_key="trade_id",
+                        pagination={"rowsPerPage": 25, "sortBy": "time", "descending": True},
+                    ).classes("w-full").style(f"background-color: {BG_PANEL};")
+
+                    # Status pill: colour-coded per outcome.
+                    arb_trade_table.add_slot("body-cell-status", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: 'white',
+                                backgroundColor:
+                                    props.row.status === 'executed'    ? '""" + GREEN + r"""' :
+                                    props.row.status === 'settled'     ? '""" + GREEN + r"""' :
+                                    props.row.status === 'dry_run'     ? '""" + YELLOW + r"""' :
+                                    props.row.status === 'rolled_back' ? '#FFA726' :
+                                    props.row.status === 'rejected'    ? '""" + RED + r"""' :
+                                                                          '""" + TEXT_SECONDARY + r"""',
+                                padding: '2px 8px', borderRadius: '10px',
+                                fontSize: '11px', fontWeight: 'bold',
+                                textTransform: 'uppercase'
+                            }">{{ props.row.status }}</span>
+                        </q-td>
+                    """)
+                    arb_trade_table.add_slot("body-cell-stake", r"""
+                        <q-td :props="props">£{{ props.row.stake_num.toFixed(2) }}</q-td>
+                    """)
+                    arb_trade_table.add_slot("body-cell-liab", r"""
+                        <q-td :props="props">£{{ props.row.liab_num.toFixed(2) }}</q-td>
+                    """)
+                    # Capital colour-coded same as Profitable Arbs:
+                    # red >£100, yellow >£30, neutral below — at-a-glance
+                    # signal of which fires tied up serious bank.
+                    arb_trade_table.add_slot("body-cell-capital", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.capital_num > 100 ? '""" + RED + r"""' :
+                                       props.row.capital_num > 30  ? '""" + YELLOW + r"""' :
+                                                                      '""" + TEXT_PRIMARY + r"""',
+                                fontWeight: 'bold'
+                            }">£{{ props.row.capital_num.toFixed(2) }}</span>
+                        </q-td>
+                    """)
+                    arb_trade_table.add_slot("body-cell-net_pct", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.net_num >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'bold'
+                            }">{{ (props.row.net_num >= 0 ? '+' : '') + props.row.net_num.toFixed(2) + '%' }}</span>
+                        </q-td>
+                    """)
+                    arb_trade_table.add_slot("body-cell-exp_pnl", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.exp_num >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'bold'
+                            }">{{ '£' + (props.row.exp_num >= 0 ? '+' : '') + props.row.exp_num.toFixed(2) }}</span>
+                        </q-td>
+                    """)
+                    arb_trade_table.add_slot("body-cell-real_pnl", r"""
+                        <q-td :props="props">
+                            <span v-if="props.row.real_num === null" :style="{
+                                color: '""" + TEXT_SECONDARY + r"""'
+                            }">—</span>
+                            <span v-else :style="{
+                                color: props.row.real_num >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""',
+                                fontWeight: 'bold'
+                            }">{{ '£' + (props.row.real_num >= 0 ? '+' : '') + props.row.real_num.toFixed(2) }}</span>
+                        </q-td>
+                    """)
+
+                    def update_trades():
+                        # Trades come from EITHER publisher (PM / LIVE).
+                        # Both read the same on-disk ledger so we just take
+                        # whichever snapshot has them and dedupe by trade_id.
+                        with dashboard._lock:
+                            scans = dict(dashboard._arb_scans)
+                        seen: dict[str, dict] = {}
+                        for snap in scans.values():
+                            for t in snap.get("trades") or []:
+                                tid = t.get("trade_id")
+                                if not tid or tid in seen:
+                                    continue
+                                seen[tid] = t
+
+                        rows = []
+                        for t in seen.values():
+                            opened = t.get("opened_at") or ""
+                            # Display HH:MM:SS only — ISO timestamp is too
+                            # wide for the table and the date is "today".
+                            time_str = opened[11:19] if len(opened) >= 19 else opened
+                            note = t.get("error") or ""
+                            if t.get("dry_run") and not note:
+                                note = "DRY-RUN — no transmission"
+                            # Dutch rows have no single back/lay leg —
+                            # back_exchange field is already a summary
+                            # like "3 legs · BF/MB/MB", lay_exchange is
+                            # "—", and back_odds/lay_odds are 0.
+                            if t.get("trade_type") == "dutch":
+                                back_leg = t.get("back_exchange") or "dutch"
+                                lay_leg  = "—"
+                            else:
+                                be = (t.get("back_exchange") or "")[:2].upper()
+                                le = (t.get("lay_exchange") or "")[:2].upper()
+                                back_leg = f"{be} @ {t.get('back_odds', 0):.2f}"
+                                lay_leg  = f"{le} @ {t.get('lay_odds', 0):.2f}"
+                            rows.append({
+                                "trade_id":  t.get("trade_id") or opened,
+                                "time":      time_str,
+                                "status":    t.get("status") or "?",
+                                "sport":     (t.get("sport") or "").title(),
+                                "fixture":   (t.get("fixture") or "")[:35],
+                                "selection": (t.get("selection") or "")[:25],
+                                "back_leg":  back_leg,
+                                "lay_leg":   lay_leg,
+                                "stake_num": float(t.get("stake") or 0.0),
+                                "liab_num":  float(t.get("liability") or 0.0),
+                                # capital = stake + liab (back/lay) or stake (dutch)
+                                "capital_num": float(t.get("capital") or 0.0),
+                                # net_margin stored as fraction; * 100 → %
+                                "net_num":   round(float(t.get("expected_net_margin") or 0.0) * 100, 2),
+                                "exp_num":   float(t.get("expected_pnl") or 0.0),
+                                "real_num":  t.get("realised_pnl"),
+                                "note":      note,
+                            })
+                        # Newest first by time string (HH:MM:SS sorts correctly within a day).
+                        rows.sort(key=lambda r: r["time"], reverse=True)
+                        arb_trade_table.rows = rows
+                        arb_trade_table.update()
+
                     ui.timer(2.0, update_arb)
+                    ui.timer(2.0, update_matches)
+                    ui.timer(2.0, update_dutch)
+                    ui.timer(2.0, update_trades)
 
             # ---- Periodic UI update — Console tab refresh ----
             # Skipped when Console tab is disabled.
@@ -706,6 +1764,7 @@ class Dashboard:
                         mode = dashboard._mode
                         dashboard._alert = ""
                         open_trades = dict(dashboard._open_trades)
+                        closed_trades = list(dashboard._closed_trades)
                         tick_prices = dict(dashboard._tick_prices)
                         scenarios = {
                             k: {
@@ -735,34 +1794,34 @@ class Dashboard:
                     # Sidecar apps (like the arb scanner) publish under
                     # their own strategy_id and have a dedicated tab —
                     # exclude them here so data isn't shown in two places.
-                    new_rows = []
-                    for sid, info in sorted(strategies.items()):
-                        if sid == "arbitrage":
-                            continue
-                        status = info.get("status", "unknown")
-                        hb_age = time.time() - info.get("last_heartbeat", 0)
-                        if hb_age > 15 and status == "running":
-                            status = "stale"
-                        pnl = info.get("pnl", 0.0)
-                        pnl_s = f"+{pnl:.2f}" if pnl >= 0 else f"{pnl:.2f}"
-                        wins = info.get("wins", 0)
-                        total_trades = info.get("trades", 0)
-                        win_pct = (
-                            f"{(wins / total_trades * 100):.0f}%"
-                            if total_trades > 0 else "--"
-                        )
-                        last_metric = info.get("last_metric", "")
-                        hb_activity = info.get("_heartbeat_activity", "")
-                        display_text = last_metric if last_metric else hb_activity
-                        new_rows.append({
-                            "strategy": sid,
-                            "status": status.upper(),
-                            "pnl": pnl_s,
-                            "pnl_raw": pnl,
-                            "trades": f"{total_trades}/{wins}",
-                            "win_pct": win_pct,
-                            "last_signal": display_text,
-                        })
+                    # Keep the scenario filter toggle options in sync
+                    # with the orchestrator's current scenario list.
+                    # Idempotent on every render — cheap even at 60fps.
+                    scen_opts = ["All"] + sorted(self._scenario_strategies.keys())
+                    if self._scenario_filter_toggle.options != scen_opts:
+                        self._scenario_filter_toggle.options = scen_opts
+                        self._scenario_filter_toggle.update()
+
+                    # Resolve which strategies should appear given the
+                    # active filter. "All" = no filter.
+                    filt = self._scenario_filter
+                    if filt and filt != "All" and filt in self._scenario_strategies:
+                        allowed_strats = set(self._scenario_strategies[filt])
+                    else:
+                        allowed_strats = None  # no filter
+
+                    # Which scenarios route each strategy? Inverse map
+                    # so per-row rendering is O(1).
+                    strat_to_scenarios: dict[str, list[str]] = {}
+                    for scen, strats_list in self._scenario_strategies.items():
+                        for s in strats_list:
+                            strat_to_scenarios.setdefault(s, []).append(scen)
+
+                    new_rows = _build_strategy_rows(
+                        strategies, allowed_strats, strat_to_scenarios,
+                        self._broker_spreads,
+                        self._scenario_spread_gates,
+                    )
                     strat_table.rows = new_rows
                     strat_table.update()
 
@@ -805,9 +1864,13 @@ class Dashboard:
                         tp = ot.get("take_profit", 0)
                         timeout_sec = ot.get("timeout_seconds", 0)
                         entry_ts = ot.get("entry_ts", 0)
+                        qty = float(ot.get("quantity", 0) or 0)
+                        opener_comm = float(ot.get("opener_commission", 0) or 0)
                         direction = ot.get("side", "?").upper()
                         tp_data = tick_prices.get(sym)
                         if tp_data:
+                            # Mark to bid when long, ask when short — the
+                            # price the position would close at right now.
                             cur_price = (
                                 tp_data["bid"] if ot.get("side") == "buy"
                                 else tp_data["ask"]
@@ -820,17 +1883,97 @@ class Dashboard:
                             fmt = ".3f"
                         else:
                             fmt = ".5f"
-                        if ot.get("side") == "buy":
-                            pnl_positive = cur_price >= entry_px
+
+                        # Live unrealised P&L (cost-inclusive):
+                        #   gross = (entry − current) × qty  for sell
+                        #           (current − entry) × qty  for buy
+                        #   RT cost estimate = 2 × opener_commission
+                        # Net = gross − RT cost. Colour by sign so a
+                        # break-even position after cost still reads as
+                        # negative (you're behind by the cost to exit).
+                        if cur_price > 0 and entry_px > 0 and qty > 0:
+                            if ot.get("side") == "buy":
+                                gross = (cur_price - entry_px) * qty
+                            else:
+                                gross = (entry_px - cur_price) * qty
+                            rt_cost = 2.0 * opener_comm
+                            pnl_raw = gross - rt_cost
+                            pnl_str = (f"+{pnl_raw:.2f}" if pnl_raw >= 0
+                                        else f"{pnl_raw:.2f}")
+                            pnl_positive = pnl_raw >= 0
                         else:
-                            pnl_positive = (
-                                cur_price <= entry_px if cur_price > 0 else True
-                            )
+                            pnl_raw = 0.0
+                            pnl_str = "--"
+                            # Fallback for "no quote yet" — use the
+                            # side-vs-entry heuristic the current_price
+                            # cell already uses so colouring stays consistent.
+                            if ot.get("side") == "buy":
+                                pnl_positive = cur_price >= entry_px
+                            else:
+                                pnl_positive = (
+                                    cur_price <= entry_px if cur_price > 0 else True
+                                )
+
+                        # Entry:Current percent move. Signed by price
+                        # direction (current > entry → positive), NOT by
+                        # P&L direction. The cell's colour is driven by
+                        # pnl_positive so a short in profit shows
+                        # negative % but green — reads as "price dropped,
+                        # short in the money".
+                        if cur_price > 0 and entry_px > 0:
+                            move_pct_raw = (cur_price - entry_px) / entry_px * 100.0
+                            move_pct_str = (f"+{move_pct_raw:.3f}%"
+                                            if move_pct_raw >= 0
+                                            else f"{move_pct_raw:.3f}%")
+                        else:
+                            move_pct_raw = 0.0
+                            move_pct_str = "--"
+
+                        # TradingView chart link. OANDA: prefix since the
+                        # default exchange on TV for these instruments.
+                        # Replace the underscore so EUR_USD → EURUSD which
+                        # matches TradingView's symbol format.
+                        # Chart URL points at our local Plotly route
+                        # (see /chart/<trade_id> in this file). trade_id
+                        # is a GUID stamped on every fill; using it
+                        # (instead of strategy+symbol) lets the chart
+                        # disambiguate when two concurrent trades exist
+                        # for the same strat/pair, and cleanly extend
+                        # to multi-instrument trades in the future.
+                        # Fallback to sid/sym path-style for legacy
+                        # positions that existed before trade_ids.
+                        tid = ot.get("trade_id", "")
+                        if tid:
+                            chart_url = f"/chart/{tid}"
+                        else:
+                            chart_url = f"/chart/legacy/{sid}/{sym}"
+
+                        # Entry time with full date + HH:MM:SS — operators
+                        # scanning history past the current session need
+                        # to see the date to disambiguate (a paused/
+                        # timeout-held position from yesterday looks the
+                        # same as a fresh one without it).
+                        if entry_ts > 0:
+                            from datetime import datetime as _dt
+                            dt = _dt.fromtimestamp(entry_ts)
+                            entry_time_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+                            entry_time_full = entry_time_str
+                        else:
+                            entry_time_str = "--"
+                            entry_time_full = ""
+
                         if timeout_sec > 0 and entry_ts > 0:
                             remaining = max(0, timeout_sec - (now_ts - entry_ts))
-                            mins = int(remaining // 60)
-                            secs = int(remaining % 60)
-                            timeout_str = f"{mins}m {secs:02d}s"
+                            # Switch to hours format when >60 min left
+                            # so an 8h timeout reads "7h 42m" not "462m".
+                            if remaining >= 3600:
+                                hours = int(remaining // 3600)
+                                mins = int((remaining % 3600) // 60)
+                                timeout_str = f"{hours}h {mins:02d}m"
+                            else:
+                                mins = int(remaining // 60)
+                                secs = int(remaining % 60)
+                                timeout_str = f"{mins}m {secs:02d}s"
                         else:
                             timeout_str = "--"
                         ot_new_rows.append({
@@ -838,23 +1981,35 @@ class Dashboard:
                             "strategy": sid,
                             "pair": sym,
                             "direction": direction,
+                            "entry_time": entry_time_str,
+                            "entry_time_raw": entry_ts,
+                            "entry_time_full": entry_time_full,
                             "entry_price": f"{entry_px:{fmt}}",
                             "current_price": (
                                 f"{cur_price:{fmt}}" if cur_price > 0 else "--"
                             ),
+                            "move_pct": move_pct_str,
+                            "move_pct_raw": move_pct_raw,
                             "stop_loss": f"{sl:{fmt}}" if sl else "--",
                             "take_profit": f"{tp:{fmt}}" if tp else "--",
+                            "pnl": pnl_str,
+                            "pnl_raw": pnl_raw,
                             "timeout": timeout_str,
                             "pnl_positive": pnl_positive,
+                            "chart_url": chart_url,
                         })
                     if not ot_new_rows:
                         ot_new_rows = [{
                             "key": "_empty",
                             "strategy": "--", "pair": "No open trades",
                             "direction": "--",
+                            "entry_time": "--", "entry_time_raw": 0, "entry_time_full": "",
                             "entry_price": "--", "current_price": "--",
+                            "move_pct": "--", "move_pct_raw": 0.0,
                             "stop_loss": "--", "take_profit": "--",
+                            "pnl": "--", "pnl_raw": 0.0,
                             "timeout": "--", "pnl_positive": True,
+                            "chart_url": "",
                         }]
                     open_trades_table.rows = ot_new_rows
                     open_trades_table.update()
@@ -867,8 +2022,10 @@ class Dashboard:
                         chart_fig["data"][0]["y"] = ys
                         pnl_chart.update()
 
-                    # Trade log
-                    if trades:
+                    # Legacy text trade log (retired — replaced by the
+                    # Recent Trades table below). Kept the branch in
+                    # case an older layout re-enables the label.
+                    if trade_log is not None and trades:
                         lines = []
                         for t in trades[:30]:
                             side_marker = "BUY " if t.get("side") == "buy" else "SELL"
@@ -879,11 +2036,443 @@ class Dashboard:
                             )
                         trade_log.set_text("\n".join(lines))
 
+                    # Recent Trades table (closed trades, realised P&L).
+                    # Pulled from the _closed_trades deque. Format each
+                    # field once here so Quasar sorting on numeric
+                    # columns has a raw number (pnl_raw, entry_time_raw)
+                    # while the display string stays human.
+                    if recent_trades_table is not None:
+                        rt_rows = []
+                        from datetime import datetime as _dt
+                        for t in list(closed_trades)[:100]:
+                            entry_px = float(t.get("entry_price") or 0)
+                            exit_px = float(t.get("exit_price") or 0)
+                            if entry_px > 50:
+                                fmt = ".2f"
+                            elif entry_px > 10:
+                                fmt = ".3f"
+                            else:
+                                fmt = ".5f"
+                            e_ts = float(t.get("entry_ts") or 0)
+                            x_ts = float(t.get("exit_ts") or 0)
+                            # Always show full date + HH:MM:SS so history
+                            # stays unambiguous across sessions / days.
+                            e_str = (_dt.fromtimestamp(e_ts).strftime("%Y-%m-%d %H:%M:%S")
+                                     if e_ts else "--")
+                            x_str = (_dt.fromtimestamp(x_ts).strftime("%Y-%m-%d %H:%M:%S")
+                                     if x_ts else "--")
+                            net = float(t.get("pnl_net") or 0)
+                            pnl_pct = float(t.get("pnl_pct") or 0)
+                            sl_v = float(t.get("stop_loss") or 0)
+                            tp_v = float(t.get("take_profit") or 0)
+                            sl_str = f"{sl_v:{fmt}}" if sl_v > 0 else "--"
+                            tp_str = f"{tp_v:{fmt}}" if tp_v > 0 else "--"
+                            rt_rows.append({
+                                # Unique key per closed trade so Quasar's
+                                # row diffing doesn't churn.
+                                "key": f"{t.get('strategy_id','?')}_{t.get('symbol','?')}_{e_ts}",
+                                "strategy": t.get("strategy_id", "?"),
+                                "pair": t.get("symbol", ""),
+                                "direction": (t.get("side") or "").upper(),
+                                "entry_time": e_str,
+                                "entry_time_raw": e_ts,
+                                "entry_price": f"{entry_px:{fmt}}",
+                                "stop_loss": sl_str,
+                                "take_profit": tp_str,
+                                "exit_time": x_str,
+                                "exit_time_raw": x_ts,
+                                "exit_price": f"{exit_px:{fmt}}",
+                                "pnl_pct": (f"+{pnl_pct:.3f}%" if pnl_pct >= 0
+                                            else f"{pnl_pct:.3f}%"),
+                                "pnl": (f"+{net:.2f}" if net >= 0 else f"{net:.2f}"),
+                                "pnl_raw": net,
+                            })
+                        if not rt_rows:
+                            rt_rows = [{
+                                "key": "_empty",
+                                "strategy": "--", "pair": "No trades yet",
+                                "direction": "--",
+                                "entry_time": "--", "entry_time_raw": 0,
+                                "entry_price": "--",
+                                "stop_loss": "--", "take_profit": "--",
+                                "exit_time": "--", "exit_time_raw": 0,
+                                "exit_price": "--",
+                                "pnl_pct": "--", "pnl": "--", "pnl_raw": 0.0,
+                            }]
+                        recent_trades_table.rows = rt_rows
+                        recent_trades_table.update()
+
                 ui.timer(1.0, update_ui)
+
+        # ------------------------------------------------------------------
+        # Chart routes — /chart/<trade_id> and /chart/legacy/<sid>/<sym>
+        # ------------------------------------------------------------------
+        # Primary route is trade_id (GUID per logical trade) — a single
+        # trade_id can reference multiple symbols (future multi-leg trades),
+        # so the renderer loops once per symbol and draws one Plotly panel
+        # per leg. Per-leg entry/SL/TP come from the OPENER fill in QuestDB
+        # matched by (trade_id, symbol) — querying fills rather than the
+        # in-memory _open_trades lets CLOSED trades be chart-able too.
+        #
+        # Legacy route keeps the old strat/sym key around for in-flight
+        # positions that opened before trade_ids existed. Can be deleted
+        # once all live positions have rolled through a post-upgrade cycle.
+
+        def _render_chart_panel(symbol: str, entry_px: float, sl_px: float,
+                                tp_px: float, side: str, entry_ts: float):
+            """One Plotly panel. Called once per symbol for multi-leg trades,
+            once for single-leg. All values resolved by the caller — this
+            function just renders what it's given. Returns silently on
+            missing QuestDB data; caller decides whether that's fatal."""
+            import psycopg2
+            tbl = f"ticks_{symbol.lower()}"
+            since_micros = int((time.time() - 24 * 3600) * 1_000_000)
+            sql = (
+                f"SELECT timestamp, avg((bid+ask)/2) AS mid "
+                f"FROM {tbl} "
+                f"WHERE timestamp >= cast({since_micros} as timestamp) "
+                f"SAMPLE BY 1m ALIGN TO CALENDAR"
+            )
+            times: list[float] = []
+            prices: list[float] = []
+            try:
+                with psycopg2.connect(
+                    host="localhost", port=8812,
+                    user="admin", password="quest", dbname="qdb",
+                ) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(sql)
+                        for ts, mid in cur.fetchall():
+                            if ts is None or mid is None:
+                                continue
+                            if hasattr(ts, "timestamp"):
+                                times.append(ts.timestamp())
+                            else:
+                                times.append(float(ts) / 1e6)
+                            prices.append(float(mid))
+            except Exception as e:
+                ui.label(f"QuestDB query failed for {symbol}: {e}").style(
+                    f"color: {RED};"
+                )
+                return
+            if not prices:
+                ui.label(f"No recent ticks for {symbol}").style(
+                    f"color: {YELLOW};"
+                )
+                return
+
+            from datetime import datetime as _dt
+            iso_times = [_dt.fromtimestamp(t).isoformat() for t in times]
+
+            fig = {
+                "data": [{
+                    "type": "scatter", "mode": "lines",
+                    "x": iso_times, "y": prices, "name": "mid",
+                    "line": {"color": PNL_LINE_COLOUR, "width": 1.5},
+                }],
+                "layout": {
+                    "paper_bgcolor": BG_PANEL, "plot_bgcolor": BG_PANEL,
+                    "font": {"color": TEXT_PRIMARY},
+                    "margin": {"l": 60, "r": 30, "t": 30, "b": 40},
+                    "xaxis": {"gridcolor": "#333", "title": "Time (last 24h)"},
+                    "yaxis": {"gridcolor": "#333", "title": f"{symbol} mid price"},
+                    "shapes": [], "annotations": [],
+                },
+            }
+
+            def _hline(y: float, colour: str, label: str):
+                fig["layout"]["shapes"].append({
+                    "type": "line",
+                    "xref": "paper", "x0": 0, "x1": 1,
+                    "yref": "y", "y0": y, "y1": y,
+                    "line": {"color": colour, "width": 1.5, "dash": "dash"},
+                })
+                fig["layout"]["annotations"].append({
+                    "xref": "paper", "x": 1.0, "xanchor": "right",
+                    "yref": "y", "y": y,
+                    "text": f"{label} {y:.5f}".rstrip("0").rstrip("."),
+                    "showarrow": False,
+                    "font": {"color": colour, "size": 11},
+                    "bgcolor": BG_PANEL,
+                })
+
+            if entry_px > 0:
+                _hline(entry_px, "#888888", "entry")
+            if sl_px > 0:
+                _hline(sl_px, RED, "SL")
+            if tp_px > 0:
+                _hline(tp_px, GREEN, "TP")
+
+            if entry_ts > 0 and entry_ts >= times[0]:
+                entry_iso = _dt.fromtimestamp(entry_ts).isoformat()
+                fig["layout"]["shapes"].append({
+                    "type": "line",
+                    "xref": "x", "x0": entry_iso, "x1": entry_iso,
+                    "yref": "paper", "y0": 0, "y1": 1,
+                    "line": {"color": "#888888", "width": 1, "dash": "dot"},
+                })
+
+            # Per-symbol header strip.
+            with ui.row().classes("w-full gap-6 px-4 py-2"):
+                ui.label(symbol).classes("text-lg font-bold").style(
+                    f"color: {TEXT_PRIMARY};"
+                )
+                if side:
+                    ui.label(f"Side: {side.upper()}").style(
+                        f"color: {GREEN if side.lower()=='buy' else RED};"
+                    )
+                if entry_px > 0:
+                    ui.label(f"Entry: {entry_px:.5f}").style(
+                        f"color: {TEXT_PRIMARY};"
+                    )
+                if sl_px > 0:
+                    ui.label(f"SL: {sl_px:.5f}").style(f"color: {RED};")
+                if tp_px > 0:
+                    ui.label(f"TP: {tp_px:.5f}").style(f"color: {GREEN};")
+                ui.label(f"Last: {prices[-1]:.5f}").style(f"color: {BLUE};")
+
+            ui.plotly(fig).classes("w-full").style("height: 500px;")
+
+        def _page_header(title: str):
+            ui.add_head_html(f"""
+            <style>
+                body {{ background-color: {BG_DARK} !important;
+                        color: {TEXT_PRIMARY} !important; }}
+            </style>
+            """)
+            with ui.row().classes("w-full items-center gap-4 px-4 py-2").style(
+                f"background-color: {BG_HEADER}; border-radius: 6px;"
+            ):
+                ui.label(title).classes("text-xl font-bold").style(
+                    f"color: {TEXT_PRIMARY};"
+                )
+                ui.link("← back", "/").style(f"color: {BLUE};")
+
+        @ui.page("/chart/{trade_id}")
+        def chart_by_trade(trade_id: str):
+            import psycopg2
+            # Look up ALL fills for this trade_id. The opener is the
+            # earliest fill; closer (if present) tells us the trade is
+            # already closed (we still render it for post-hoc review).
+            # Multiple symbols under one trade_id = multi-leg; render one
+            # panel per distinct symbol.
+            rows: list[tuple] = []
+            try:
+                with psycopg2.connect(
+                    host="localhost", port=8812,
+                    user="admin", password="quest", dbname="qdb",
+                ) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT CAST(timestamp AS LONG), symbol, side, "
+                            "price, stop_loss, take_profit, strategy_id "
+                            "FROM fills WHERE trade_id = %s ORDER BY timestamp",
+                            (trade_id,),
+                        )
+                        rows = cur.fetchall()
+            except Exception as e:
+                _page_header(f"trade {trade_id[:12]}… (query error)")
+                ui.label(f"QuestDB query failed: {e}").style(f"color: {RED};")
+                return
+
+            if not rows:
+                _page_header(f"trade {trade_id[:12]}… (unknown)")
+                ui.label(
+                    "No fills found for this trade_id — may be a legacy "
+                    "open position without a stamped GUID."
+                ).style(f"color: {YELLOW};")
+                return
+
+            # Group by symbol; for each, pick the earliest fill as opener.
+            by_symbol: dict[str, dict] = {}
+            strat: str = ""
+            for ts_us, sym, sd, px, sl, tp, sid in rows:
+                strat = strat or (sid or "")
+                entry = by_symbol.setdefault(sym, {
+                    "entry_ts": (ts_us or 0) / 1e6,
+                    "entry_price": float(px) if px is not None else 0.0,
+                    "stop_loss": float(sl) if sl is not None else 0.0,
+                    "take_profit": float(tp) if tp is not None else 0.0,
+                    "side": sd or "",
+                })
+
+            _page_header(
+                f"{strat} — trade {trade_id[:12]}… ({len(by_symbol)} leg"
+                f"{'s' if len(by_symbol) > 1 else ''})"
+            )
+
+            for sym, leg in by_symbol.items():
+                _render_chart_panel(
+                    sym, leg["entry_price"], leg["stop_loss"],
+                    leg["take_profit"], leg["side"], leg["entry_ts"],
+                )
+
+        @ui.page("/chart/legacy/{strategy}/{symbol}")
+        def chart_legacy(strategy: str, symbol: str):
+            # Fallback for open positions that predate trade_ids. Uses
+            # the live in-memory _open_trades snapshot directly since no
+            # fill row exists with a trade_id to query on.
+            pos = dashboard._open_trades.get((strategy, symbol))
+            _page_header(f"{strategy} — {symbol} (legacy)")
+            entry_px = float(pos.get("entry_price", 0)) if pos else 0.0
+            sl_px = float(pos.get("stop_loss", 0)) if pos else 0.0
+            tp_px = float(pos.get("take_profit", 0)) if pos else 0.0
+            side = (pos.get("side") if pos else "") or ""
+            entry_ts = float(pos.get("entry_ts", 0)) if pos else 0.0
+            _render_chart_panel(symbol, entry_px, sl_px, tp_px, side, entry_ts)
 
     # ------------------------------------------------------------------ #
     # ZMQ subscriber threads
     # ------------------------------------------------------------------ #
+
+    def _seed_from_questdb(self, host: str = "localhost",
+                             pg_port: int = 8812,
+                             days: int = 7,
+                             limit: int = 500) -> None:
+        """Pre-populate the Recent Trades deque from QuestDB's fills table.
+
+        The orchestrator writes every fill there (see
+        ModularTradeApp/console/core/store.py). On startup we pull the
+        most recent N fills within the last `days` days, most-recent
+        first, so the dashboard has content immediately rather than
+        waiting for the next live fill.
+
+        Silently no-ops if QuestDB isn't reachable — the dashboard is
+        not required to have history to start; live fills will populate
+        as they come.
+        """
+        try:
+            import psycopg2
+        except ImportError:
+            logger.warning("psycopg2 not installed — skipping trade history seed")
+            return
+
+        since_micros = int((time.time() - days * 86400) * 1_000_000)
+        sql = (
+            "SELECT CAST(timestamp AS LONG), scenario_id, strategy_id, symbol, "
+            "side, order_id, quantity, price, commission, stop_loss, "
+            "take_profit, timeout_seconds, tag, trade_id "
+            "FROM fills "
+            "WHERE timestamp >= cast(%s as timestamp) "
+            "ORDER BY timestamp DESC LIMIT %s"
+        )
+        try:
+            with psycopg2.connect(
+                host=host, port=pg_port,
+                user="admin", password="quest", dbname="qdb",
+            ) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, (since_micros, limit))
+                    rows = cur.fetchall()
+        except Exception:
+            logger.warning(
+                "Trade history seed failed — QuestDB unreachable? "
+                "GUI will still populate from live fills.",
+                exc_info=True,
+            )
+            return
+
+        seeded = 0
+        with self._lock:
+            for r in rows:
+                (ts_us, scen, strat, sym, side, oid, qty, px, comm,
+                 sl, tp, tmo, tag, tid) = r
+                # Newest-first from the query; appendleft preserves
+                # that ordering in the deque.
+                self._trades.appendleft({
+                    "timestamp": (ts_us or 0) / 1e6,
+                    "scenario_id": scen,
+                    "strategy_id": strat or "unknown",
+                    "symbol": sym or "",
+                    "side": side or "",
+                    "price": float(px) if px is not None else 0.0,
+                    "quantity": float(qty) if qty is not None else 0.0,
+                    "commission": float(comm) if comm is not None else 0.0,
+                    "order_id": oid or "",
+                    "tag": tag or "",
+                    "trade_id": tid or "",
+                })
+                seeded += 1
+
+            # Pair openers with closers to populate _closed_trades.
+            # Walk chronologically (reverse the newest-first rows) so
+            # FIFO netting matches live behaviour. Keyed by
+            # (scenario_id, strategy_id, symbol) because a fan-out gives
+            # each scenario its own position book.
+            chrono = list(reversed(rows))
+            open_positions: dict = {}  # key → list of open fills
+            closed_count = 0
+            for r in chrono:
+                (ts_us, scen, strat, sym, side, oid, qty, px, comm,
+                 sl, tp, tmo, tag, tid) = r
+                if not sym or not strat or qty is None:
+                    continue
+                key = (scen or "legacy", strat, sym)
+                book = open_positions.setdefault(key, [])
+                # If opposite-direction fill exists, net against it
+                remaining = float(qty)
+                while remaining > 0 and book:
+                    head = book[0]
+                    if head["side"] == side:
+                        break  # same direction — adds to book, not closes
+                    close_qty = min(remaining, head["qty"])
+                    if head["side"] == "buy":
+                        pnl = (float(px) - head["px"]) * close_qty
+                    else:
+                        pnl = (head["px"] - float(px)) * close_qty
+                    opener_comm = head.get("comm", 0.0)
+                    rt_cost = 2.0 * (opener_comm * close_qty / max(head["qty_orig"], 1))
+                    net_pnl = pnl - rt_cost
+                    pnl_pct = (
+                        ((float(px) - head["px"]) / head["px"] * 100.0)
+                        if head["px"] > 0 else 0.0
+                    )
+                    trade_key = (scen, strat, sym, head["ts"])
+                    if trade_key not in self._closed_trade_keys:
+                        self._closed_trade_keys.add(trade_key)
+                        self._closed_trades.appendleft({
+                            "scenario_id": scen,
+                            "strategy_id": strat,
+                            "symbol": sym,
+                            "side": head["side"],
+                            "quantity": close_qty,
+                            "entry_ts": head["ts"],
+                            "entry_price": head["px"],
+                            # Opener-side SL/TP preserved on the closed
+                            # record so the Past Trades table can show
+                            # whether the exit landed at an SL/TP level.
+                            "stop_loss": head.get("sl", 0.0),
+                            "take_profit": head.get("tp", 0.0),
+                            "exit_ts": (ts_us or 0) / 1e6,
+                            "exit_price": float(px),
+                            "pnl_gross": pnl,
+                            "pnl_net": net_pnl,
+                            "pnl_pct": pnl_pct,
+                        })
+                        closed_count += 1
+                    head["qty"] -= close_qty
+                    remaining -= close_qty
+                    if head["qty"] <= 0:
+                        book.pop(0)
+                # Any remainder is a new open-side fill — add to book
+                if remaining > 0:
+                    book.append({
+                        "side": side,
+                        "px": float(px) if px is not None else 0.0,
+                        "qty": remaining,
+                        "qty_orig": float(qty),
+                        "ts": (ts_us or 0) / 1e6,
+                        "comm": float(comm) if comm is not None else 0.0,
+                        # Carry the opener fill's SL/TP so the closer
+                        # (which frequently doesn't have these fields)
+                        # can still show the target levels post-hoc.
+                        "sl": float(sl) if sl is not None else 0.0,
+                        "tp": float(tp) if tp is not None else 0.0,
+                    })
+        logger.info(
+            "Seeded %d historical fills + %d closed trades from QuestDB",
+            seeded, closed_count,
+        )
 
     def _start_zmq(self):
         self._zmq_running = True
@@ -973,8 +2562,18 @@ class Dashboard:
     # -- handlers (ported verbatim from ModularTradeApp GUI) -----------
 
     def _on_arb_scan(self, msg: dict):
-        """Whole-snapshot replacement from an arb scanner sidecar."""
+        """Whole-snapshot replacement from an arb scanner publisher.
+
+        Two publishers send to topic "arb.scan" — pre-match (strategy_id
+        "arbitrage") and live (strategy_id "arbitrage_live"). We keep both
+        snapshots distinct in self._arb_scans so the Arbitrage tab can
+        render rows from each side simultaneously, tagged "PM" / "LIVE".
+        """
         with self._lock:
+            sid = msg.get("strategy_id") or "arbitrage"
+            self._arb_scans[sid] = msg
+            # Keep _arb_scan pointing at whichever scan landed most recently
+            # so legacy single-snapshot code paths don't break.
             self._arb_scan = msg
 
     def _on_fill(self, msg: dict):
@@ -1032,8 +2631,59 @@ class Dashboard:
                     info["wins"] = info.get("wins", 0) + 1
                     scen_info["wins"] += 1
                     scen_strat["wins"] += 1
+
+                # Record this closed trade for the Recent Trades
+                # TABLE. Cost-inclusive P&L = gross − 2 × opener_comm
+                # (estimate of the RT cost, matching the Open Trades
+                # P&L column's convention).
+                entry_ts = existing.get("entry_ts", 0)
+                opener_comm = float(existing.get("opener_commission", 0) or 0)
+                rt_cost = 2.0 * opener_comm
+                net_pnl = pnl - rt_cost
+                pnl_pct = (
+                    ((price - entry_px) / entry_px * 100.0)
+                    if entry_px > 0 else 0.0
+                )
+                dedup_key = (scen_id, sid, symbol, entry_ts)
+                if dedup_key not in self._closed_trade_keys:
+                    self._closed_trade_keys.add(dedup_key)
+                    self._closed_trades.appendleft({
+                        "scenario_id": scen_id,
+                        "strategy_id": sid,
+                        "symbol": symbol,
+                        "side": existing["side"],
+                        "quantity": close_qty,
+                        "entry_ts": entry_ts,
+                        "entry_price": entry_px,
+                        # Opener-side SL/TP — carried through so the
+                        # Past Trades table can show "exit at SL" vs
+                        # "strategy-initiated close" at a glance.
+                        "stop_loss": existing.get("stop_loss", 0),
+                        "take_profit": existing.get("take_profit", 0),
+                        "exit_ts": msg.get("timestamp", time.time()),
+                        "exit_price": price,
+                        "pnl_gross": pnl,
+                        "pnl_net": net_pnl,
+                        "pnl_pct": pnl_pct,
+                    })
+                    # Keep the dedup set bounded by forgetting the
+                    # oldest keys as the deque evicts them.
+                    if len(self._closed_trade_keys) > MAX_TRADE_LOG * 2:
+                        self._closed_trade_keys = set(
+                            (t.get("scenario_id"), t.get("strategy_id"),
+                             t.get("symbol"), t.get("entry_ts"))
+                            for t in self._closed_trades
+                        )
+                # Trader-tab P&L total: sum across plugin strategies
+                # ONLY — sidecars like the sports arbitrage scanner
+                # publish fills too but belong on their own tab, and
+                # mixing them into the cumulative P&L chart conflates
+                # two separate books. `_SIDECAR_SIDS` is the excluded
+                # set; extend when adding new non-trader sidecars.
                 self._total_pnl = sum(
-                    s.get("pnl", 0) for s in self._strategies.values()
+                    s.get("pnl", 0)
+                    for sid, s in self._strategies.items()
+                    if sid not in _SIDECAR_SIDS
                 )
                 del self._open_trades[key]
             elif not existing:
@@ -1067,8 +2717,16 @@ class Dashboard:
 
             if name == "pnl":
                 info["pnl"] = float(value)
+                # Trader-tab P&L total: sum across plugin strategies
+                # ONLY — sidecars like the sports arbitrage scanner
+                # publish fills too but belong on their own tab, and
+                # mixing them into the cumulative P&L chart conflates
+                # two separate books. `_SIDECAR_SIDS` is the excluded
+                # set; extend when adding new non-trader sidecars.
                 self._total_pnl = sum(
-                    s.get("pnl", 0) for s in self._strategies.values()
+                    s.get("pnl", 0)
+                    for sid, s in self._strategies.items()
+                    if sid not in _SIDECAR_SIDS
                 )
 
             severity = msg.get("severity", "")
@@ -1087,6 +2745,13 @@ class Dashboard:
             if status:
                 info["status"] = status
             info["last_heartbeat"] = time.time()
+            # Stash the publisher-side activity string so other tabs
+            # (specifically the Arbitrage status label) can show "MB
+            # lockout — waiting Xs" without needing to subscribe to
+            # the heartbeat themselves.
+            activity = msg.get("activity", "")
+            if activity:
+                info["activity"] = activity
 
             mode = msg.get("mode", "")
             if mode:
@@ -1121,6 +2786,7 @@ class Dashboard:
                         "take_profit": pos.get("take_profit", 0),
                         "timeout_seconds": pos.get("timeout_seconds", 0),
                         "entry_ts": pos.get("entry_ts", 0),
+                        "trade_id": pos.get("trade_id", ""),
                     }
 
                 existing_keys = {
@@ -1150,6 +2816,57 @@ class Dashboard:
                 if not info["last_metric"] or info.get("_metric_age", 999) > 10:
                     info["last_metric"] = activity_display
                 info["_heartbeat_activity"] = activity_display
+
+            # Per-condition + filter-trace payload published by the
+            # plugin harness (see ModularTradeApp CLAUDE.md Dashboard
+            # section for shape). The Conditions column in the strategy
+            # table renders these so operators can see every filter and
+            # entry condition with pass/fail colour. Stash the latest
+            # value — missing = "no update this heartbeat", keep the
+            # prior value rather than clear it.
+            if "entry_trace" in msg:
+                info["_entry_trace"] = msg["entry_trace"]
+            if "filter_trace" in msg:
+                info["_filter_trace"] = msg["filter_trace"]
+            if "filter_block" in msg:
+                info["_filter_block"] = msg["filter_block"]
+            # Per-symbol trace maps — each multi-instrument plugin
+            # publishes one entry per symbol. The row builder emits a
+            # separate (strategy, symbol) row per key.
+            if "entry_traces_by_symbol" in msg:
+                info.setdefault("_entry_traces_by_symbol", {}).update(
+                    msg["entry_traces_by_symbol"])
+            if "filter_traces_by_symbol" in msg:
+                info.setdefault("_filter_traces_by_symbol", {}).update(
+                    msg["filter_traces_by_symbol"])
+            if "filter_blocks_by_symbol" in msg:
+                # Overwrite rather than update — None values are
+                # meaningful (current pass), and a stale dict-update
+                # would keep a dead symbol forever.
+                info["_filter_blocks_by_symbol"] = dict(
+                    msg["filter_blocks_by_symbol"] or {})
+
+            # Scenario membership — orchestrator's authoritative list
+            # of {scenario: [strategies]}. Stash globally (not per
+            # strategy) because the scenario filter pill lives above
+            # the table and needs the full map.
+            scen_strats = msg.get("scenario_strategies")
+            if isinstance(scen_strats, dict) and scen_strats:
+                self._scenario_strategies = scen_strats
+
+            # Per-broker spread snapshot for the spread column.
+            broker_spreads = msg.get("broker_spreads")
+            if isinstance(broker_spreads, dict) and broker_spreads:
+                self._broker_spreads = broker_spreads
+
+            # Per-scenario spread gate snapshot. Shape:
+            # {scenario_id: {symbol: {spread_bps, threshold_bps,
+            # passed, data_source}}}. Empty for scenarios without
+            # spread_max_bps set. GUI colours the scenario chips per
+            # (strategy, symbol) row based on this.
+            sgates = msg.get("scenario_spread_gates")
+            if isinstance(sgates, dict) and sgates:
+                self._scenario_spread_gates = sgates
 
     def _on_command(self, msg: dict):
         action = msg.get("action", "")

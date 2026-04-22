@@ -13,3 +13,9 @@ config.yaml
 
 # Runtime log from `python -m zmq_gui` when redirected to a file
 *.log
+
+# NiceGUI per-browser user-storage files (created by app.storage.user)
+.nicegui/
+
+# Local MCP server config — paths are machine-specific
+.mcp.json
