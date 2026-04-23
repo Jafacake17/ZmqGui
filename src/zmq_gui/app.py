@@ -33,8 +33,43 @@ from typing import Optional
 
 import zmq
 from nicegui import app, ui
+from nicegui.elements.timer import Timer as _NgTimer
+from contextlib import nullcontext as _nullcontext
 
 from .bus import Bus
+
+
+# ---------------------------------------------------------------------- #
+# NiceGUI timer parent-slot-deleted race fix
+# ---------------------------------------------------------------------- #
+# `nicegui.element.Element.parent_slot` is a property that raises
+# RuntimeError when its weakref'd slot has been GC'd (e.g. after a
+# client disconnects and the per-session element tree is torn down).
+# `Timer._get_context` reads it every tick — so a timer whose slot has
+# just been deleted logs a full traceback at ERROR via
+# `background_tasks._handle_exceptions`, even though the only action
+# needed is "stop ticking".
+#
+# NiceGUI's own `_should_stop` checks `is_deleted` and `client.id not
+# in Client.instances` but not the slot-weakref-dead case, so the
+# race still escapes. We narrowly patch `Timer._get_context` to catch
+# the RuntimeError and fall back to `nullcontext()` — the next pass
+# of the surrounding loop's `_should_stop` check exits cleanly.
+#
+# Trigger observed this session: the external health-check `curl /`
+# probe opens a short-lived NiceGUI session; teardown races with the
+# 1–2s `ui.timer` callbacks. Three clusters of 6 tracebacks each on
+# 2026-04-22 22:47:24, 2026-04-23 00:48:44, and 2026-04-23 04:49:34,
+# always ~1 min after a sweep.
+def _safe_timer_get_context(self):
+    try:
+        ps = self.parent_slot
+    except RuntimeError:
+        return _nullcontext()
+    return ps or _nullcontext()
+
+
+_NgTimer._get_context = _safe_timer_get_context
 from .config import GuiCfg, load as load_config
 from .theme import (
     BG_DARK, BG_PANEL, BG_HEADER,
