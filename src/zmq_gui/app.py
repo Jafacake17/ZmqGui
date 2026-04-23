@@ -60,6 +60,18 @@ _SIDECAR_SIDS = {"arbitrage", "arbitrage_live"}
 # Condition-chip rendering
 # ---------------------------------------------------------------------- #
 
+def _fmt_age(seconds: float) -> str:
+    """Compact relative-time formatter: "12s", "4m", "2h", "3d"."""
+    s = max(0.0, float(seconds))
+    if s < 60:
+        return f"{s:.0f}s"
+    if s < 3600:
+        return f"{s / 60:.0f}m"
+    if s < 86400:
+        return f"{s / 3600:.1f}h"
+    return f"{s / 86400:.1f}d"
+
+
 def _fmt_trace_num(v) -> str:
     """Short numeric formatter for condition chips.
 
@@ -378,6 +390,13 @@ class Dashboard:
         self._arb_scans: dict[str, dict] = {}
         self._arb_scan: Optional[dict] = None
 
+        # KnowledgeVault repo-hook heartbeats keyed by repo name, so
+        # the Vault tab shows one row per repo with its latest commit
+        # status. Value shape mirrors the publisher envelope
+        # (status, activity, repo, sha, ts) plus `_received` = local
+        # wall-clock when this process saw it (used for "Xs ago").
+        self._vault_hooks: dict[str, dict] = {}
+
         # Mode label (e.g. "live" / "paper") — updated from heartbeat.
         self._mode: str = "--"
 
@@ -498,6 +517,10 @@ class Dashboard:
                     ui.tab("Arbitrage").style(f"color: {TEXT_PRIMARY};")
                     if cfg.tabs.get("arb", True) else None
                 )
+                vault_tab = (
+                    ui.tab("Vault").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("vault", True) else None
+                )
 
             # Restore the last-selected tab across page reloads via per-browser
             # user storage. Falls back to the first enabled tab if the saved
@@ -507,6 +530,7 @@ class Dashboard:
                     ("Console", console_tab),
                     ("FTMO MT5", ftmo_tab),
                     ("Arbitrage", arb_tab),
+                    ("Vault", vault_tab),
                 ) if t is not None
             ]
             saved_tab = app.storage.user.get("active_tab")
@@ -688,6 +712,11 @@ class Dashboard:
                     # field to avoid string-ordering "10 < 2" surprises.
                     ot_columns = [
                         {"name": "strategy", "label": "Strategy", "field": "strategy", "align": "left", "sortable": True},
+                        # Execution venue (e.g. "oanda-practice", "ftmo-mt5").
+                        # Distinct from scenario_id/account_id (one broker
+                        # can hold multiple accounts). Blank for pre-2026-04-22
+                        # history — rendered as "—".
+                        {"name": "broker", "label": "Broker", "field": "broker", "align": "left", "sortable": True},
                         {"name": "pair", "label": "Pair", "field": "pair", "align": "left", "sortable": True},
                         {"name": "direction", "label": "Direction", "field": "direction", "align": "center", "sortable": True},
                         # Entry time is sortable numerically via the hidden
@@ -716,6 +745,7 @@ class Dashboard:
                     ot_rows = [{
                         "key": "_empty",
                         "strategy": "--",
+                        "broker": "--",
                         "pair": "No open trades",
                         "direction": "--",
                         "entry_price": "--",
@@ -826,6 +856,7 @@ class Dashboard:
                     # trade NEVER hit.
                     rt_columns = [
                         {"name": "strategy", "label": "Strategy", "field": "strategy", "align": "left", "sortable": True},
+                        {"name": "broker", "label": "Broker", "field": "broker", "align": "left", "sortable": True},
                         {"name": "pair", "label": "Pair", "field": "pair", "align": "left", "sortable": True},
                         {"name": "direction", "label": "Direction", "field": "direction", "align": "center", "sortable": True},
                         {"name": "entry_time", "label": "Entry Time", "field": "entry_time", "align": "left", "sortable": True, "sort": "numeric"},
@@ -1747,6 +1778,101 @@ class Dashboard:
                     ui.timer(2.0, update_dutch)
                     ui.timer(2.0, update_trades)
 
+              # ================ VAULT TAB ================
+              # KnowledgeVault repo-hook heartbeats. One row per repo,
+              # keyed on repo name (latest commit overwrites). Activity
+              # is the publisher's "OK: <repo> <sha>" / "FAIL: <reason>"
+              # string; status drives the row colour.
+              if vault_tab is not None:
+                with ui.tab_panel(vault_tab):
+                    with ui.row().classes("w-full items-center gap-6 px-4 py-2").style(
+                        f"background-color: {BG_PANEL}; border-radius: 6px;"
+                    ):
+                        vault_status_label = ui.label(
+                            "KnowledgeVault: waiting for first repo-hook heartbeat…"
+                        ).style(f"color: {YELLOW}; font-weight: bold;")
+                        vault_summary_label = ui.label("").style(
+                            f"color: {TEXT_SECONDARY};"
+                        )
+
+                    vault_columns = [
+                        {"name": "repo",     "label": "Repo",     "field": "repo",     "align": "left",  "sortable": True},
+                        {"name": "status",   "label": "Status",   "field": "status",   "align": "center","sortable": True},
+                        {"name": "sha",      "label": "SHA",      "field": "sha",      "align": "left",  "sortable": False},
+                        {"name": "activity", "label": "Activity", "field": "activity", "align": "left",  "sortable": False},
+                        {"name": "when",     "label": "When",     "field": "when",     "align": "right", "sortable": True},
+                    ]
+                    vault_table = ui.table(
+                        columns=vault_columns, rows=[], row_key="repo",
+                        pagination={"rowsPerPage": 25, "sortBy": "when", "descending": False},
+                    ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
+
+                    # Status chip — green for running (OK), red for failed,
+                    # yellow for anything else (future: "stale" if we start
+                    # ageing out rows after, say, 7d).
+                    vault_table.add_slot("body-cell-status", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: 'white',
+                                backgroundColor: props.row.status === 'running' ? '""" + GREEN + r"""'
+                                              : props.row.status === 'failed'  ? '""" + RED   + r"""'
+                                              : '""" + YELLOW + r"""',
+                                padding: '2px 8px', borderRadius: '10px',
+                                fontSize: '11px', fontWeight: 'bold'
+                            }">{{ props.row.status.toUpperCase() }}</span>
+                        </q-td>
+                    """)
+                    # Monospace short sha so 7-char hashes line up nicely.
+                    vault_table.add_slot("body-cell-sha", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                fontFamily: 'monospace',
+                                color: '""" + TEXT_SECONDARY + r"""'
+                            }">{{ props.row.sha }}</span>
+                        </q-td>
+                    """)
+
+                    def update_vault():
+                        with dashboard._lock:
+                            hooks = {k: dict(v) for k, v in dashboard._vault_hooks.items()}
+
+                        if not hooks:
+                            return  # keep the "waiting…" label
+
+                        now = time.time()
+                        rows = []
+                        for repo, h in hooks.items():
+                            age = now - h.get("_received", now)
+                            rows.append({
+                                "repo":     repo,
+                                "status":   h.get("status", "unknown"),
+                                "sha":      h.get("sha", ""),
+                                "activity": h.get("activity", ""),
+                                # Raw seconds for sorting; display string
+                                # computed here so Vue doesn't have to
+                                # (age column sorts on the numeric key).
+                                "when":     _fmt_age(age),
+                                "_age_s":   age,
+                            })
+                        rows.sort(key=lambda r: r["_age_s"])
+
+                        vault_table.rows = rows
+                        vault_table.update()
+
+                        # Header: "N repos tracked | last activity Xs ago"
+                        newest = min((r["_age_s"] for r in rows), default=0)
+                        vault_status_label.set_text(
+                            f"KnowledgeVault: {len(rows)} repo(s) tracked"
+                        )
+                        vault_status_label.style(
+                            replace=f"color: {GREEN}; font-weight: bold;"
+                        )
+                        vault_summary_label.set_text(
+                            f"last hook {_fmt_age(newest)} ago"
+                        )
+
+                    ui.timer(2.0, update_vault)
+
             # ---- Periodic UI update — Console tab refresh ----
             # Skipped when Console tab is disabled.
             if console_tab is not None:
@@ -1979,6 +2105,7 @@ class Dashboard:
                         ot_new_rows.append({
                             "key": f"{sid}_{sym}",
                             "strategy": sid,
+                            "broker": ot.get("broker_id") or "—",
                             "pair": sym,
                             "direction": direction,
                             "entry_time": entry_time_str,
@@ -2001,7 +2128,8 @@ class Dashboard:
                     if not ot_new_rows:
                         ot_new_rows = [{
                             "key": "_empty",
-                            "strategy": "--", "pair": "No open trades",
+                            "strategy": "--", "broker": "--",
+                            "pair": "No open trades",
                             "direction": "--",
                             "entry_time": "--", "entry_time_raw": 0, "entry_time_full": "",
                             "entry_price": "--", "current_price": "--",
@@ -2072,6 +2200,7 @@ class Dashboard:
                                 # row diffing doesn't churn.
                                 "key": f"{t.get('strategy_id','?')}_{t.get('symbol','?')}_{e_ts}",
                                 "strategy": t.get("strategy_id", "?"),
+                                "broker": t.get("broker_id") or "—",
                                 "pair": t.get("symbol", ""),
                                 "direction": (t.get("side") or "").upper(),
                                 "entry_time": e_str,
@@ -2090,7 +2219,8 @@ class Dashboard:
                         if not rt_rows:
                             rt_rows = [{
                                 "key": "_empty",
-                                "strategy": "--", "pair": "No trades yet",
+                                "strategy": "--", "broker": "--",
+                                "pair": "No trades yet",
                                 "direction": "--",
                                 "entry_time": "--", "entry_time_raw": 0,
                                 "entry_price": "--",
@@ -2348,10 +2478,13 @@ class Dashboard:
             return
 
         since_micros = int((time.time() - days * 86400) * 1_000_000)
+        # broker_id was added to the fills table 2026-04-22; rows
+        # pre-dating that have broker_id = empty string. The renderer
+        # shows "—" for those so they visibly flag as legacy.
         sql = (
             "SELECT CAST(timestamp AS LONG), scenario_id, strategy_id, symbol, "
             "side, order_id, quantity, price, commission, stop_loss, "
-            "take_profit, timeout_seconds, tag, trade_id "
+            "take_profit, timeout_seconds, tag, trade_id, broker_id "
             "FROM fills "
             "WHERE timestamp >= cast(%s as timestamp) "
             "ORDER BY timestamp DESC LIMIT %s"
@@ -2376,7 +2509,7 @@ class Dashboard:
         with self._lock:
             for r in rows:
                 (ts_us, scen, strat, sym, side, oid, qty, px, comm,
-                 sl, tp, tmo, tag, tid) = r
+                 sl, tp, tmo, tag, tid, broker) = r
                 # Newest-first from the query; appendleft preserves
                 # that ordering in the deque.
                 self._trades.appendleft({
@@ -2385,6 +2518,7 @@ class Dashboard:
                     "strategy_id": strat or "unknown",
                     "symbol": sym or "",
                     "side": side or "",
+                    "broker_id": broker or "",
                     "price": float(px) if px is not None else 0.0,
                     "quantity": float(qty) if qty is not None else 0.0,
                     "commission": float(comm) if comm is not None else 0.0,
@@ -2404,7 +2538,7 @@ class Dashboard:
             closed_count = 0
             for r in chrono:
                 (ts_us, scen, strat, sym, side, oid, qty, px, comm,
-                 sl, tp, tmo, tag, tid) = r
+                 sl, tp, tmo, tag, tid, broker) = r
                 if not sym or not strat or qty is None:
                     continue
                 key = (scen or "legacy", strat, sym)
@@ -2434,6 +2568,10 @@ class Dashboard:
                             "scenario_id": scen,
                             "strategy_id": strat,
                             "symbol": sym,
+                            # Carried from the opener fill; pre-fix
+                            # historical rows have broker = "" which
+                            # the renderer surfaces as "—".
+                            "broker_id": head.get("broker") or "",
                             "side": head["side"],
                             "quantity": close_qty,
                             "entry_ts": head["ts"],
@@ -2468,6 +2606,7 @@ class Dashboard:
                         # can still show the target levels post-hoc.
                         "sl": float(sl) if sl is not None else 0.0,
                         "tp": float(tp) if tp is not None else 0.0,
+                        "broker": broker or "",
                     })
         logger.info(
             "Seeded %d historical fills + %d closed trades from QuestDB",
@@ -2552,6 +2691,11 @@ class Dashboard:
             self._on_fill(msg)
         elif topic.startswith("metric."):
             self._on_metric(msg)
+        elif topic == "heartbeat.vault-repo-hook":
+            # Divert BEFORE the generic heartbeat path so it never
+            # lands in self._strategies — it's a sidecar with its own
+            # Vault tab, not a trading strategy.
+            self._on_vault_hook(msg)
         elif topic.startswith("heartbeat."):
             self._on_heartbeat(msg)
         elif topic == "command":
@@ -2576,6 +2720,30 @@ class Dashboard:
             # so legacy single-snapshot code paths don't break.
             self._arb_scan = msg
 
+    def _on_vault_hook(self, msg: dict):
+        """KnowledgeVault repo-hook heartbeat — one per git post-commit.
+
+        Envelope (from scripts/heartbeat.py on the vault side):
+            status:  "running" | "failed"
+            activity: "OK: <repo> <sha>" | "FAIL: <reason>"
+            repo:    repo name (used as our row key)
+            sha:     short sha
+            ts:      ISO8601 publisher timestamp
+
+        Keying by repo — multiple commits to the same repo just
+        overwrite, so the Vault tab always shows latest-state.
+        """
+        repo = msg.get("repo") or "(unknown)"
+        with self._lock:
+            self._vault_hooks[repo] = {
+                "status":   msg.get("status", "unknown"),
+                "activity": msg.get("activity", ""),
+                "repo":     repo,
+                "sha":      msg.get("sha", ""),
+                "ts":       msg.get("ts", ""),
+                "_received": time.time(),
+            }
+
     def _on_fill(self, msg: dict):
         sid = msg.get("strategy_id", "unknown")
         symbol = msg.get("symbol", "")
@@ -2584,6 +2752,10 @@ class Dashboard:
         quantity = msg.get("quantity", 0)
         scen_id = msg.get("scenario_id") or "default"
         order_id = msg.get("order_id", "")
+        # Execution venue — added upstream 2026-04-22. Older fills (and
+        # the historical QuestDB backfill) lack the field; the tables
+        # render "—" for those rather than failing sorts.
+        broker_id = msg.get("broker_id", "")
         dedup_key = (scen_id, order_id)
         key = (sid, symbol)
 
@@ -2651,6 +2823,11 @@ class Dashboard:
                         "scenario_id": scen_id,
                         "strategy_id": sid,
                         "symbol": symbol,
+                        # Broker is the opener's venue — a closing
+                        # fill from a different broker would be a bug,
+                        # but we defensively fall back to the closer's
+                        # broker_id if the opener didn't record one.
+                        "broker_id": existing.get("broker_id") or broker_id,
                         "side": existing["side"],
                         "quantity": close_qty,
                         "entry_ts": entry_ts,
@@ -2689,6 +2866,7 @@ class Dashboard:
             elif not existing:
                 self._open_trades[key] = {
                     "strategy": sid, "symbol": symbol, "side": side,
+                    "broker_id": broker_id,
                     "entry_price": price, "quantity": quantity,
                     "stop_loss": msg.get("stop_loss", 0),
                     "take_profit": msg.get("take_profit", 0),
@@ -2780,6 +2958,7 @@ class Dashboard:
                     self._open_trades[k] = {
                         "strategy": sid_pos, "symbol": sym,
                         "side": pos.get("side", ""),
+                        "broker_id": pos.get("broker_id", ""),
                         "entry_price": pos.get("entry_price", 0),
                         "quantity": pos.get("quantity", 0),
                         "stop_loss": pos.get("stop_loss", 0),
