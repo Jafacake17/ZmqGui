@@ -413,6 +413,14 @@ class Dashboard:
         self._zmq_running = False
         self._zmq_thread = None
         self._feed_thread = None
+        # Watchdog counter — incremented at the top of every zmq_loop
+        # iteration, including empty polls. The watchdog thread samples
+        # this every 60s to detect the 2026-04-21-style wedge where the
+        # process stays alive but the event loop goes silent.
+        # Python int increments are atomic under the GIL, so no lock
+        # is needed for a write-one-read-one counter.
+        self._zmq_ticks: int = 0
+        self._watchdog_thread = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -2624,6 +2632,55 @@ class Dashboard:
                 target=self._feed_loop, name="zmqgui-feed", daemon=True,
             )
             self._feed_thread.start()
+        # Watchdog — see _watchdog_loop. Started AFTER zmq so the
+        # first 60-second sample has real ticks to count.
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, name="zmqgui-watchdog", daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _watchdog_loop(self, interval_s: float = 60.0,
+                        stall_threshold: int = 3) -> None:
+        """Detect the 2026-04-21-style event-loop wedge externally-visibly.
+
+        Every `interval_s` seconds, sample `self._zmq_ticks` and compare
+        to the last sample. Non-zero delta → INFO ("watchdog: ..."); zero
+        delta → WARN. `stall_threshold` consecutive zero-delta windows
+        escalates to ERROR so a parent sweep grepping the log can
+        distinguish "briefly quiet" from "wedged".
+
+        The INFO line is grep-able from outside the process (the parent
+        health-check sweep reads zmqgui.log) so this doubles as an
+        external heartbeat — silence for >interval_s with no log line
+        also indicates trouble.
+        """
+        last = self._zmq_ticks
+        zero_streak = 0
+        while self._zmq_running:
+            time.sleep(interval_s)
+            now = self._zmq_ticks
+            delta = now - last
+            last = now
+            if delta > 0:
+                zero_streak = 0
+                logger.info(
+                    "watchdog: zmq loop ticked %d times in last %.0fs (%.1f Hz)",
+                    delta, interval_s, delta / interval_s,
+                )
+            else:
+                zero_streak += 1
+                if zero_streak >= stall_threshold:
+                    logger.error(
+                        "watchdog: ZMQ LOOP WEDGED — 0 ticks for %d consecutive "
+                        "%.0fs windows (~%.0fs silent)",
+                        zero_streak, interval_s, zero_streak * interval_s,
+                    )
+                else:
+                    logger.warning(
+                        "watchdog: 0 ticks in last %.0fs (%d consecutive; "
+                        "will escalate to ERROR after %d)",
+                        interval_s, zero_streak, stall_threshold,
+                    )
 
     def _zmq_loop(self):
         """Subscribe to every configured PUB endpoint and route messages.
@@ -2645,6 +2702,10 @@ class Dashboard:
         poller.register(sub, zmq.POLLIN)
 
         while self._zmq_running:
+            # Watchdog counter — incremented every iteration, including
+            # empty polls. "Ticked" means "the loop made a pass"; a
+            # true wedge (like 2026-04-21 08:01) would freeze this.
+            self._zmq_ticks += 1
             events = dict(poller.poll(timeout=100))
             if sub not in events:
                 continue
