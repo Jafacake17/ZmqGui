@@ -177,6 +177,17 @@ def _calc_commission_bps(commission_rate: float, extra_comm: float, mid: float, 
 # Condition-chip rendering
 # ---------------------------------------------------------------------- #
 
+def _fmt_currency(amount: float, currency: str = "GBP") -> str:
+    """Format currency with 2 decimals and thousands separators.
+
+    E.g. 1234.5 -> "£1,234.50"
+    """
+    if not isinstance(amount, (int, float)):
+        return "—"
+    symbol = "£" if currency == "GBP" else currency
+    return f"{symbol}{amount:,.2f}"
+
+
 def _fmt_age(seconds: float) -> str:
     """Compact relative-time formatter: "12s", "4m", "2h", "3d"."""
     s = max(0.0, float(seconds))
@@ -529,6 +540,10 @@ class Dashboard:
         # (status, activity, repo, sha, ts) plus `_received` = local
         # wall-clock when this process saw it (used for "Xs ago").
         self._vault_hooks: dict[str, dict] = {}
+
+        # Arbitrage exchange balances: {strategy_id: {exchanges: [...]}}
+        # Latest envelope from balance.arbitrage topic (paper + live streams)
+        self._balance_arbitrage: Optional[dict] = None
 
         # Mode label (e.g. "live" / "paper") — updated from heartbeat.
         self._mode: str = "--"
@@ -1276,6 +1291,34 @@ class Dashboard:
                         arb_summary_label = ui.label("").style(f"color: {TEXT_SECONDARY};")
                         arb_pnl_label = ui.label("").style(f"color: {TEXT_SECONDARY};")
 
+                    # ===== Exchange Balances =====
+                    ui.label("Exchange Balances").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;"
+                    )
+                    balance_columns = [
+                        {"name": "exchange", "label": "Exchange", "field": "exchange", "align": "left"},
+                        {"name": "balance", "label": "Total : (Available)/(Locked)", "field": "balance", "align": "left"},
+                    ]
+                    balance_rows = [
+                        {"exchange": "Betfair", "balance": "— : (—)/(—)", "error": None, "stale": False, "last_fetched": ""},
+                        {"exchange": "Matchbook", "balance": "— : (—)/(—)", "error": None, "stale": False, "last_fetched": ""},
+                    ]
+                    balance_table = ui.table(
+                        columns=balance_columns, rows=balance_rows, row_key="exchange",
+                    ).classes("w-full").style(f"background-color: {BG_PANEL};")
+
+                    # Style stale + error rows with grey text and tooltips
+                    balance_table.add_slot("body-cell-balance", r"""
+                        <q-td :props="props" :style="{
+                            color: (props.row.stale || props.row.error) ? '""" + TEXT_SECONDARY + r"""' : '""" + TEXT_PRIMARY + r"""',
+                            opacity: (props.row.stale || props.row.error) ? 0.6 : 1.0
+                        }">
+                            <div :title="props.row.error || (props.row.stale ? 'Stale: ' + props.row.last_fetched : '')">
+                                {{ props.row.balance }}
+                            </div>
+                        </q-td>
+                    """)
+
                     # ===== HERO: Profitable Arbs =====
                     # The point of this whole tab. Sortable by P&L (default)
                     # or by Age so newly-opened arbs jump to the top.
@@ -1429,6 +1472,48 @@ class Dashboard:
                             strategies = {
                                 k: dict(v) for k, v in dashboard._strategies.items()
                             }
+                            balance_envelope = dashboard._balance_arbitrage
+
+                        # Update exchange balances panel
+                        balance_new_rows = [
+                            {"exchange": "Betfair", "balance": "— : (—)/(—)", "error": None, "stale": False, "last_fetched": ""},
+                            {"exchange": "Matchbook", "balance": "— : (—)/(—)", "error": None, "stale": False, "last_fetched": ""},
+                        ]
+                        if balance_envelope:
+                            exchanges_list = balance_envelope.get("exchanges") or []
+                            for exch in exchanges_list:
+                                exch_name = exch.get("exchange", "").lower()
+                                display_name = "Betfair" if exch_name == "betfair" else "Matchbook" if exch_name == "matchbook" else None
+
+                                if display_name:
+                                    error = exch.get("error")
+                                    stale = exch.get("stale", False)
+                                    last_fetched = exch.get("last_fetched", "")
+
+                                    if error:
+                                        balance_str = "— : (—)/(—)"
+                                    elif stale or not all(k in exch for k in ["total", "available", "locked"]):
+                                        balance_str = "— : (—)/(—)"
+                                    else:
+                                        total = float(exch.get("total", 0))
+                                        available = float(exch.get("available", 0))
+                                        locked = float(exch.get("locked", 0))
+                                        total_fmt = _fmt_currency(total, exch.get("currency", "GBP"))
+                                        avail_fmt = _fmt_currency(available, exch.get("currency", "GBP"))
+                                        locked_fmt = _fmt_currency(locked, exch.get("currency", "GBP"))
+                                        balance_str = f"{total_fmt} : ({avail_fmt})/({locked_fmt})"
+
+                                    # Find and update the matching row
+                                    for row in balance_new_rows:
+                                        if row["exchange"] == display_name:
+                                            row["balance"] = balance_str
+                                            row["error"] = error
+                                            row["stale"] = stale
+                                            row["last_fetched"] = last_fetched
+                                            break
+
+                        balance_table.rows = balance_new_rows
+                        balance_table.update()
 
                         # Detect MB lockout from either publisher's heartbeat —
                         # status="errored" + activity mentions "lockout".
@@ -3092,6 +3177,9 @@ class Dashboard:
             # lands in self._strategies — it's a sidecar with its own
             # Vault tab, not a trading strategy.
             self._on_vault_hook(msg)
+        elif topic == "balance.arbitrage":
+            # Arbitrage exchange balances (Betfair, Matchbook)
+            self._on_balance_arbitrage(msg)
         elif topic.startswith("heartbeat."):
             self._on_heartbeat(msg)
         elif topic == "command":
@@ -3100,6 +3188,16 @@ class Dashboard:
             self._on_arb_scan(msg)
 
     # -- handlers (ported verbatim from ModularTradeApp GUI) -----------
+
+    def _on_balance_arbitrage(self, msg: dict):
+        """Store arbitrage exchange balances (Betfair, Matchbook).
+
+        Two publishers send to topic "balance.arbitrage" — paper (strategy_id
+        "arbitrage") and live (strategy_id "arbitrage_live"). Both envelopes
+        have identical structure; we keep the most recent one for rendering.
+        """
+        with self._lock:
+            self._balance_arbitrage = msg
 
     def _on_arb_scan(self, msg: dict):
         """Whole-snapshot replacement from an arb scanner publisher.
