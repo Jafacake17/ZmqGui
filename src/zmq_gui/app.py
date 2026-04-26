@@ -32,9 +32,11 @@ from collections import deque
 from typing import Optional
 
 import zmq
+import yaml
 from nicegui import app, ui
 from nicegui.elements.timer import Timer as _NgTimer
 from contextlib import nullcontext as _nullcontext
+from pathlib import Path
 
 from .bus import Bus
 
@@ -89,6 +91,86 @@ MAX_PNL_POINTS = 500
 # these OUT of the trader-tab cumulative P&L so the chart reflects
 # plugin trading only. Extend when adding non-trader sidecars.
 _SIDECAR_SIDS = {"arbitrage", "arbitrage_live"}
+
+# Instruments with IBKR coverage (3-cap on free tier depth subscriptions)
+_IBKR_INSTRUMENTS = {"EUR_USD", "GBP_USD", "USD_JPY"}
+
+
+# ---------------------------------------------------------------------- #
+# Broker cost profile loading
+# ---------------------------------------------------------------------- #
+
+def _load_broker_profiles() -> dict[str, dict]:
+    """
+    Load broker cost profiles from YAML files in ModularTradeApp/console/brokers/.
+    Returns: {broker_id: {symbol: {commission_model, commission_rate, extra_commission}}}
+    """
+    profiles = {}
+    brokers_path = Path(os.path.expanduser("~")) / "ModularTradeApp" / "console" / "brokers"
+
+    if not brokers_path.exists():
+        logger.warning(f"Brokers config path not found: {brokers_path}")
+        return profiles
+
+    for yaml_file in brokers_path.glob("*.yaml"):
+        try:
+            with open(yaml_file) as f:
+                cfg = yaml.safe_load(f) or {}
+
+            broker_id = cfg.get("id", yaml_file.stem)
+            cost_profile = cfg.get("cost_profile", {})
+
+            # Extract forex profile as default, then instrument-specific overrides
+            broker_prof = {}
+            forex_prof = cost_profile.get("forex", {})
+            if forex_prof:
+                broker_prof["_default"] = {
+                    "commission_model": forex_prof.get("commission_model", "per_unit"),
+                    "commission_rate": float(forex_prof.get("commission_rate", 0.0)),
+                    "extra_commission_per_trade": float(forex_prof.get("extra_commission_per_trade", 0.0)),
+                }
+
+            # Per-instrument overrides
+            for sym, sym_cfg in cost_profile.get("instruments", {}).items():
+                if isinstance(sym_cfg, dict):
+                    broker_prof[sym] = {
+                        "commission_model": sym_cfg.get("commission_model", forex_prof.get("commission_model", "per_unit")),
+                        "commission_rate": float(sym_cfg.get("commission_rate", 0.0)),
+                        "extra_commission_per_trade": float(sym_cfg.get("extra_commission_per_trade", 0.0)),
+                    }
+
+            profiles[broker_id] = broker_prof
+            logger.info(f"Loaded broker profile: {broker_id}")
+        except Exception as e:
+            logger.warning(f"Failed to load broker profile {yaml_file}: {e}")
+
+    return profiles
+
+
+def _calc_commission_bps(commission_rate: float, extra_comm: float, mid: float, qty: float,
+                         commission_model: str = "per_unit") -> float:
+    """
+    Calculate round-trip commission in basis points.
+    Formula from deployment_router._pick_best_spread_target:
+    - per_unit: (qty * commission_rate * 2) / mid * 10000
+    - notional_pct: (qty * mid * commission_rate * 2) / (mid * qty) * 10000 = commission_rate * 2 * 10000
+    Plus: (extra_comm * 2) / mid * 10000
+    """
+    comm_bps = 0.0
+    if qty > 0 and mid > 0:
+        if commission_model == "notional_pct":
+            # commission_rate is already a % of notional
+            comm_bps = commission_rate * 2 * 10_000
+        else:
+            # per_unit: qty * rate (in quote currency)
+            comm_per_fill = qty * commission_rate
+            comm_bps = (comm_per_fill * 2 / mid) * 10_000
+
+        # Add flat per-trade fee
+        if extra_comm > 0:
+            comm_bps += (extra_comm * 2 / mid) * 10_000
+
+    return comm_bps
 
 
 # ---------------------------------------------------------------------- #
@@ -347,6 +429,22 @@ def _build_condition_chips(info: dict) -> list[dict]:
                     "label": f"{name}: {obs} {op} {thr}",
                     "color": color,
                 })
+
+    # Broker routing annotation — show most recent broker used for fills
+    last_broker = info.get("last_broker_id", "")
+    if last_broker:
+        # Abbreviated broker names for display (oanda-practice → OANDA, etc.)
+        broker_display = (
+            "OANDA" if "oanda" in last_broker.lower() else
+            "Duka" if "dukascopy" in last_broker.lower() else
+            "IBKR" if "ibkr" in last_broker.lower() else
+            last_broker[:6]
+        )
+        chips.append({
+            "label": f"Routed → {broker_display}",
+            "color": BLUE,
+        })
+
     return chips
 
 # Dedup window for fills — publishers may dual-publish every fill on
@@ -444,10 +542,19 @@ class Dashboard:
         # Latest tick prices from the feed PUB — symbol → {bid, ask}
         self._tick_prices: dict[str, dict] = {}
 
+        # Broker cost profiles: {broker_id: {symbol: {commission_model, commission_rate, extra_commission}}}
+        # Loaded from ModularTradeApp/console/brokers/*.yaml on startup
+        self._broker_profiles = _load_broker_profiles()
+
+        # IBKR live quotes from tcp://127.0.0.1:5566 — {symbol: {bid, ask, spread}}
+        # Only EUR_USD, GBP_USD, USD_JPY have coverage (3-cap on free-tier depth)
+        self._ibkr_quotes: dict[str, dict] = {}
+
         # ZMQ thread control
         self._zmq_running = False
         self._zmq_thread = None
         self._feed_thread = None
+        self._ibkr_feed_thread = None
         # Watchdog counter — incremented at the top of every zmq_loop
         # iteration, including empty polls. The watchdog thread samples
         # this every 60s to detect the 2026-04-21-style wedge where the
@@ -626,6 +733,50 @@ class Dashboard:
                                 color: props.row.pnl_raw >= 0 ? '""" + GREEN + r"""' : '""" + RED + r"""'
                             }">{{ props.row.pnl }}</span>
                         </q-td>
+                    """)
+
+                    # ---- Broker Effective Costs panel ----
+                    # Shows spread + commission for OANDA, Dukascopy, IBKR across
+                    # EUR_USD, GBP_USD, USD_JPY (IBKR-enabled instruments).
+                    # Used for "would route here" decision visualization.
+                    ui.label("Broker Effective Costs").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    broker_cost_columns = [
+                        {"name": "instrument", "label": "Instrument", "field": "instrument", "align": "left"},
+                        {"name": "oanda", "label": "OANDA", "field": "oanda", "align": "center"},
+                        {"name": "dukascopy", "label": "Dukascopy", "field": "dukascopy", "align": "center"},
+                        {"name": "ibkr", "label": "IBKR", "field": "ibkr", "align": "center"},
+                    ]
+                    broker_cost_rows = [
+                        {"instrument": sym, "oanda": "—", "dukascopy": "—", "ibkr": "—"}
+                        for sym in sorted(_IBKR_INSTRUMENTS)
+                    ]
+                    broker_cost_table = ui.table(
+                        columns=broker_cost_columns, rows=broker_cost_rows, row_key="instrument",
+                    ).classes("w-full").style(f"background-color: {BG_PANEL};")
+
+                    # Colour code cells: green = best, yellow = medium, red = worst
+                    broker_cost_table.add_slot("body-cell-oanda", r"""
+                        <q-td :props="props" :style="{
+                            backgroundColor: props.row.oanda_best ? '""" + GREEN + r"""22' : 'transparent',
+                            color: props.row.oanda_best ? '""" + GREEN + r"""' : '""" + TEXT_PRIMARY + r"""',
+                            fontWeight: props.row.oanda_best ? 'bold' : 'normal'
+                        }">{{ props.row.oanda }}</q-td>
+                    """)
+                    broker_cost_table.add_slot("body-cell-dukascopy", r"""
+                        <q-td :props="props" :style="{
+                            backgroundColor: props.row.duka_best ? '""" + GREEN + r"""22' : 'transparent',
+                            color: props.row.duka_best ? '""" + GREEN + r"""' : '""" + TEXT_PRIMARY + r"""',
+                            fontWeight: props.row.duka_best ? 'bold' : 'normal'
+                        }">{{ props.row.dukascopy }}</q-td>
+                    """)
+                    broker_cost_table.add_slot("body-cell-ibkr", r"""
+                        <q-td :props="props" :style="{
+                            backgroundColor: props.row.ibkr_best ? '""" + GREEN + r"""22' : (props.row.ibkr === '—' ? 'transparent' : '""" + YELLOW + r"""22'),
+                            color: props.row.ibkr_best ? '""" + GREEN + r"""' : (props.row.ibkr === '—' ? '""" + TEXT_SECONDARY + r"""' : '""" + TEXT_PRIMARY + r"""'),
+                            fontWeight: props.row.ibkr_best ? 'bold' : 'normal'
+                        }">{{ props.row.ibkr }}</q-td>
                     """)
 
                     # ---- Scenario filter (pills above the strategy table) ----
@@ -2024,6 +2175,97 @@ class Dashboard:
                     scen_table.rows = scen_new_rows
                     scen_table.update()
 
+                    # Broker effective costs panel — show spread + commission per broker
+                    # for IBKR-enabled instruments (EUR_USD, GBP_USD, USD_JPY).
+                    # Used for "would route here" visualization.
+                    with dashboard._lock:
+                        broker_spreads = dict(dashboard._broker_spreads)
+                        ibkr_quotes = dict(dashboard._ibkr_quotes)
+                    broker_profiles = dashboard._broker_profiles
+
+                    # Build rows: one per IBKR instrument with effective costs
+                    broker_cost_new_rows = []
+                    for instrument in sorted(_IBKR_INSTRUMENTS):
+                        costs_per_broker = {}  # {broker_id: effective_bps or None}
+
+                        for broker_id in ["oanda-practice", "dukascopy-demo", "ibkr-pro"]:
+                            spread_bps = None
+                            comm_bps = 0.0
+                            mid = 0.0
+
+                            # Get current spread
+                            spread_info = broker_spreads.get(broker_id, {}).get(instrument, {})
+                            if spread_info:
+                                spread_bps = float(spread_info.get("spread_bps", 0))
+                                if spread_bps < 0:
+                                    spread_bps = None  # Invalid spread
+                            elif broker_id == "ibkr-pro" and instrument in ibkr_quotes:
+                                # Use IBKR live quote if available
+                                q = ibkr_quotes[instrument]
+                                ts = q.get("timestamp", 0)
+                                age = time.time() - ts
+                                # Stale if >30s old
+                                if age <= 30.0:
+                                    spread_bps = q.get("spread", 0)
+                                    if spread_bps < 0:
+                                        spread_bps = None
+
+                            # Get mid price for commission calculation (qty=1000 standard)
+                            if broker_id == "ibkr-pro" and instrument in ibkr_quotes:
+                                q = ibkr_quotes[instrument]
+                                bid = q.get("bid", 0)
+                                ask = q.get("ask", 0)
+                                if bid > 0 and ask > bid:
+                                    mid = (bid + ask) / 2.0
+                            elif spread_info and "bid" in spread_info and "ask" in spread_info:
+                                bid = float(spread_info.get("bid", 0))
+                                ask = float(spread_info.get("ask", 0))
+                                if bid > 0 and ask > bid:
+                                    mid = (bid + ask) / 2.0
+
+                            # Calculate commission (only if mid is valid and spread exists)
+                            if mid > 0 and spread_bps is not None:
+                                prof = broker_profiles.get(broker_id, {})
+                                # Check per-instrument override first, else default
+                                sym_prof = prof.get(instrument)
+                                if not sym_prof:
+                                    sym_prof = prof.get("_default", {})
+
+                                if sym_prof:
+                                    commission_rate = float(sym_prof.get("commission_rate", 0))
+                                    extra_comm = float(sym_prof.get("extra_commission_per_trade", 0))
+                                    commission_model = sym_prof.get("commission_model", "per_unit")
+                                    # Use standard qty=1000 for comparison
+                                    comm_bps = _calc_commission_bps(
+                                        commission_rate, extra_comm, mid, 1000,
+                                        commission_model
+                                    )
+
+                            # Effective cost = spread + commission (only if both valid)
+                            if spread_bps is not None and spread_bps >= 0 and mid > 0:
+                                effective_bps = spread_bps + comm_bps
+                                costs_per_broker[broker_id] = effective_bps
+                            else:
+                                costs_per_broker[broker_id] = None
+
+                        # Format display strings and find best
+                        valid_costs = {k: v for k, v in costs_per_broker.items() if v is not None and v >= 0}
+                        best_broker = min(valid_costs.items(), key=lambda x: x[1], default=(None, float("inf")))[0] if valid_costs else None
+
+                        row = {
+                            "instrument": instrument,
+                            "oanda": f"{costs_per_broker.get('oanda-practice'):.2f}" if costs_per_broker.get('oanda-practice') is not None else "—",
+                            "dukascopy": f"{costs_per_broker.get('dukascopy-demo'):.2f}" if costs_per_broker.get('dukascopy-demo') is not None else "—",
+                            "ibkr": f"{costs_per_broker.get('ibkr-pro'):.2f}" if costs_per_broker.get('ibkr-pro') is not None else "—",
+                            "oanda_best": best_broker == "oanda-practice",
+                            "duka_best": best_broker == "dukascopy-demo",
+                            "ibkr_best": best_broker == "ibkr-pro",
+                        }
+                        broker_cost_new_rows.append(row)
+
+                    broker_cost_table.rows = broker_cost_new_rows
+                    broker_cost_table.update()
+
                     # Open trades
                     ot_new_rows = []
                     now_ts = time.time()
@@ -2667,6 +2909,11 @@ class Dashboard:
                 target=self._feed_loop, name="zmqgui-feed", daemon=True,
             )
             self._feed_thread.start()
+        # IBKR depth daemon feed for live quotes (tcp://127.0.0.1:5566)
+        self._ibkr_feed_thread = threading.Thread(
+            target=self._ibkr_feed_loop, name="zmqgui-ibkr", daemon=True,
+        )
+        self._ibkr_feed_thread.start()
         # Watchdog — see _watchdog_loop. Started AFTER zmq so the
         # first 60-second sample has real ticks to count.
         self._watchdog_thread = threading.Thread(
@@ -2781,6 +3028,59 @@ class Dashboard:
         sub.close()
         bus.close()
 
+    def _ibkr_feed_loop(self):
+        """Separate SUB socket for IBKR depth daemon live quotes (tcp://127.0.0.1:5566).
+
+        Only EUR_USD, GBP_USD, USD_JPY have IBKR coverage (3-cap on free-tier
+        depth subscriptions). Stores {bid, ask, spread} per symbol.
+        """
+        ibkr_port = int(os.environ.get("IBKR_ZMQ_PUB_PORT", "5566"))
+        ibkr_endpoint = f"tcp://127.0.0.1:{ibkr_port}"
+        bus = Bus()
+        try:
+            sub = bus.subscriber(ibkr_endpoint, ["tick."])
+        except Exception as e:
+            logger.warning(f"IBKR feed SUB failed ({ibkr_endpoint}): {e}")
+            bus.close()
+            return
+
+        poller = zmq.Poller()
+        poller.register(sub, zmq.POLLIN)
+
+        logger.info(f"IBKR feed loop started on :{ibkr_port}")
+
+        while self._zmq_running:
+            events = dict(poller.poll(timeout=200))
+            if sub not in events:
+                continue
+            try:
+                msg = Bus.sub_recv(sub)
+            except Exception:
+                continue
+
+            topic = msg.get("topic", "")
+            if topic.startswith("tick."):
+                symbol = topic.split(".", 1)[1]
+                # Only track IBKR-enabled instruments
+                if symbol in _IBKR_INSTRUMENTS:
+                    bid = float(msg.get("bid") or 0)
+                    ask = float(msg.get("ask") or 0)
+                    spread_bps = 0.0
+                    if bid > 0 and ask > bid:
+                        mid = (bid + ask) / 2.0
+                        spread_bps = (ask - bid) / mid * 10_000
+
+                    with self._lock:
+                        self._ibkr_quotes[symbol] = {
+                            "bid": bid,
+                            "ask": ask,
+                            "spread": spread_bps,
+                            "timestamp": msg.get("timestamp", time.time()),
+                        }
+
+        sub.close()
+        bus.close()
+
     def _process_message(self, msg: dict):
         topic = msg.get("topic", "")
         if topic.startswith("fill."):
@@ -2883,6 +3183,9 @@ class Dashboard:
             })
             info["trades"] += 1
             info["last_heartbeat"] = time.time()
+            # Track most recent broker for this strategy (for display in entry-trace)
+            if broker_id:
+                info["last_broker_id"] = broker_id
 
             existing = self._open_trades.get(key)
             if existing and existing["side"] != side:
