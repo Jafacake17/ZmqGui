@@ -269,11 +269,14 @@ def _build_strategy_rows(strategies: dict,
         if not symbols:
             # Fall back to a single aggregated row so the strategy
             # still appears while warmup/first-tick is pending.
+            wc, wt = _warming_count(info)
             rows.append({
                 "strategy_symbol": f"{sid}::",
                 "strategy": sid,
                 "symbol": "—",
                 "status": status.upper(),
+                "warming": f"{wc}/{wt}" if wc > 0 else "—",
+                "warming_active": wc > 0,
                 "last_signal": display_text,
                 "condition_chips": _build_condition_chips(info),
                 "scenario_chips": _build_scenario_chips(
@@ -291,11 +294,14 @@ def _build_strategy_rows(strategies: dict,
                 "_spec_conditions": info.get("_spec_conditions"),
                 "_spec_filters": info.get("_spec_filters"),
             }
+            wc, wt = _warming_count(per)
             rows.append({
                 "strategy_symbol": f"{sid}::{sym}",
                 "strategy": sid,
                 "symbol": sym,
                 "status": status.upper(),
+                "warming": f"{wc}/{wt}" if wc > 0 else "—",
+                "warming_active": wc > 0,
                 "last_signal": display_text,
                 "condition_chips": _build_condition_chips(per),
                 "scenario_chips": _build_scenario_chips(
@@ -534,6 +540,22 @@ def _build_condition_chips(info: dict) -> list[dict]:
         })
 
     return chips
+
+
+def _warming_count(info: dict) -> tuple[int, int]:
+    """Count entry conditions where observed=None vs total conditions.
+
+    Returns (warming, total). Returns (0, 0) when conds is empty —
+    empty means no entry-eval data yet (filter-blocked, not warming),
+    so we don't surface a misleading count.
+    """
+    trace = info.get("_entry_trace") or {}
+    conds = trace.get("conditions") or {}
+    if not conds:
+        return 0, 0
+    warming = sum(1 for v in conds.values() if v.get("observed") is None)
+    return warming, len(conds)
+
 
 # Dedup window for fills — publishers may dual-publish every fill on
 # both `fill.<scenario>.<strategy>` and `fill.<strategy>` during the
@@ -907,6 +929,10 @@ class Dashboard:
                         {"name": "strategy", "label": "Strategy", "field": "strategy", "align": "left"},
                         {"name": "symbol", "label": "Symbol", "field": "symbol", "align": "left"},
                         {"name": "status", "label": "Status", "field": "status", "align": "center"},
+                        # Warming column: how many entry conditions have
+                        # observed=None (indicator not yet warmed). Shows
+                        # "N/M" in yellow while warming, "—" when all ready.
+                        {"name": "warming", "label": "Warming", "field": "warming", "align": "center"},
                         {"name": "scenarios", "label": "Scenarios", "field": "scenarios", "align": "left"},
                         {"name": "spread", "label": "Spread (bps)", "field": "spread", "align": "right"},
                         {"name": "last_signal", "label": "Last Signal", "field": "last_signal", "align": "left"},
@@ -925,6 +951,15 @@ class Dashboard:
                                      : '""" + RED + r"""',
                                 fontWeight: 'bold'
                             }">{{ props.row.status }}</span>
+                        </q-td>
+                    """)
+                    strat_table.add_slot("body-cell-warming", r"""
+                        <q-td :props="props" style="text-align: center;">
+                            <span :style="{
+                                color: props.row.warming_active ? '""" + YELLOW + r"""' : '""" + TEXT_SECONDARY + r"""',
+                                fontWeight: props.row.warming_active ? 'bold' : 'normal',
+                                fontSize: '12px',
+                            }">{{ props.row.warming }}</span>
                         </q-td>
                     """)
                     # Spread cell: renders one value per scenario data
