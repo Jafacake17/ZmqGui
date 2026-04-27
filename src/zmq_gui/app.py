@@ -3003,14 +3003,14 @@ class Dashboard:
                     trade_key = (scen, strat, sym, head["ts"])
                     if trade_key not in self._closed_trade_keys:
                         self._closed_trade_keys.add(trade_key)
+                        # Broker from opener; fall back to closer if opener empty.
+                        # For pre-2026-04-22 data both may be empty, showing "—".
+                        final_broker = head.get("broker") or broker or ""
                         self._closed_trades.appendleft({
                             "scenario_id": scen,
                             "strategy_id": strat,
                             "symbol": sym,
-                            # Carried from the opener fill; pre-fix
-                            # historical rows have broker = "" which
-                            # the renderer surfaces as "—".
-                            "broker_id": head.get("broker") or "",
+                            "broker_id": final_broker,
                             "side": head["side"],
                             "quantity": close_qty,
                             "entry_ts": head["ts"],
