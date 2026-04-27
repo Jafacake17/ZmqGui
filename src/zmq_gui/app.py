@@ -647,10 +647,14 @@ class Dashboard:
         # Mode label (e.g. "live" / "paper") — updated from heartbeat.
         self._mode: str = "--"
 
-        # Economic calendar health alarm — set when alert.econ_calendar.*
-        # arrives; cleared (set to None) if > 2h old at render time.
+        # Economic calendar health state.
+        # _econ_cal_alarm: last non-OK message (stale/degraded/rotted)
+        # _econ_cal_ok_ts: timestamp of last .ok heartbeat received
+        # _econ_cal_ok_msg: last .ok payload (carries last_successful_fetch_age_sec)
         self._econ_cal_alarm: dict | None = None
         self._econ_cal_alarm_ts: float = 0.0
+        self._econ_cal_ok_ts: float = 0.0
+        self._econ_cal_ok_msg: dict | None = None
 
         # Open trades — keyed by (strategy_id, symbol). An entry fill
         # opens a position; a closing fill (opposite side, same key)
@@ -2899,20 +2903,27 @@ class Dashboard:
                 ui.timer(1.0, update_ui)
 
             # ---- Calendar health badge — runs regardless of active tab ----
-            # 2h TTL: if no alarm has arrived in 2h, show OK (alarms only
-            # fire when health tool finds a problem; silence = healthy).
-            _ECON_CAL_ALARM_TTL = 7200
+            # OK requires a fresh .ok heartbeat within 1h (Modular publishes
+            # every 30min → 1.5× safety factor). Alarms take precedence when
+            # they arrived after the last .ok. No .ok within 1h → yellow
+            # "stale heartbeat" even if no alarm is active.
+            _ECON_CAL_OK_TTL = 3600
 
             def update_cal_badge():
                 with dashboard._lock:
                     alarm = dashboard._econ_cal_alarm
                     alarm_ts = dashboard._econ_cal_alarm_ts
-                if alarm is None or (time.time() - alarm_ts > _ECON_CAL_ALARM_TTL):
-                    cal_label.set_text("Calendar: OK")
-                    cal_label.style(replace=f"color: {GREEN}; font-size: 12px;")
-                else:
+                    ok_ts = dashboard._econ_cal_ok_ts
+                    ok_msg = dashboard._econ_cal_ok_msg
+
+                now = time.time()
+                # Alarm is "active" if it arrived more recently than the last .ok
+                has_active_alarm = alarm is not None and alarm_ts > ok_ts
+                last_ok_age = (now - ok_ts) if ok_ts > 0 else float("inf")
+
+                if has_active_alarm:
                     verdict = alarm.get("verdict", "?")
-                    age = _fmt_age(time.time() - alarm_ts)
+                    age = _fmt_age(now - alarm_ts)
                     reasons = alarm.get("reasons") or []
                     first_reason = reasons[0][:50] if reasons else ""
                     cal_color = RED if verdict in ("STALE", "ROTTED") else YELLOW
@@ -2922,6 +2933,17 @@ class Dashboard:
                     )
                     cal_label.style(
                         replace=f"color: {cal_color}; font-weight: bold; font-size: 12px;"
+                    )
+                elif last_ok_age <= _ECON_CAL_OK_TTL:
+                    fetch_age = ok_msg.get("last_successful_fetch_age_sec") if ok_msg else None
+                    detail = f" (fetched {_fmt_age(fetch_age)} ago)" if fetch_age is not None else ""
+                    cal_label.set_text(f"Calendar: OK{detail}")
+                    cal_label.style(replace=f"color: {GREEN}; font-size: 12px;")
+                else:
+                    age_str = _fmt_age(last_ok_age) if ok_ts > 0 else "never"
+                    cal_label.set_text(f"Calendar: stale heartbeat ({age_str})")
+                    cal_label.style(
+                        replace=f"color: {YELLOW}; font-weight: bold; font-size: 12px;"
                     )
 
             ui.timer(5.0, update_cal_badge)
@@ -3589,10 +3611,19 @@ class Dashboard:
             }
 
     def _on_econ_calendar_alert(self, msg: dict):
-        """Economic calendar health alarm (alert.econ_calendar.stale/degraded/rotted)."""
+        """Economic calendar health message (ok heartbeat or stale/degraded/rotted alarm)."""
+        verdict = msg.get("verdict", "")
         with self._lock:
-            self._econ_cal_alarm = msg
-            self._econ_cal_alarm_ts = time.time()
+            if verdict == "OK":
+                self._econ_cal_ok_ts = time.time()
+                self._econ_cal_ok_msg = msg
+                logger.info("Calendar health OK heartbeat received (fetch age: %ss)",
+                            msg.get("last_successful_fetch_age_sec"))
+            else:
+                self._econ_cal_alarm = msg
+                self._econ_cal_alarm_ts = time.time()
+                logger.warning("Calendar health alarm: verdict=%s reasons=%s",
+                               verdict, msg.get("reasons", []))
 
     def _on_fill(self, msg: dict):
         # Check if this is a Crypto fill (has spec_id instead of strategy_id)
