@@ -2226,6 +2226,161 @@ class Dashboard:
 
                     ui.timer(2.0, update_vault)
 
+              # ================ CRYPTO TAB ================
+              if crypto_tab is not None:
+                with ui.tab_panel(crypto_tab):
+                    ui.label("Crypto Paper-Trader").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+
+                    # Top metrics
+                    with ui.row().classes("w-full gap-4 mt-2"):
+                        total_fills_card = ui.card().classes("flex-1").style(f"background-color: {BG_PANEL};")
+                        with total_fills_card:
+                            ui.label("Total Fills (Today)").style(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+                            fills_label = ui.label("0").style(f"color: {GREEN}; font-weight: bold; font-size: 20px;")
+
+                        profit_card = ui.card().classes("flex-1").style(f"background-color: {BG_PANEL};")
+                        with profit_card:
+                            ui.label("Sum Profit ($)").style(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+                            profit_label = ui.label("$0.00").style(f"color: {GREEN}; font-weight: bold; font-size: 20px;")
+
+                    # Per-strategy table
+                    ui.label("Strategies").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    crypto_strat_columns = [
+                        {"name": "spec_id", "label": "Spec ID", "field": "spec_id", "align": "left"},
+                        {"name": "chains", "label": "Chains", "field": "chains", "align": "left"},
+                        {"name": "freshness", "label": "Heartbeat Age", "field": "freshness", "align": "center"},
+                        {"name": "halted", "label": "Halted", "field": "halted", "align": "center"},
+                        {"name": "fills", "label": "Fills", "field": "fills", "align": "center"},
+                        {"name": "last_fill", "label": "Last Fill", "field": "last_fill", "align": "center"},
+                    ]
+                    crypto_strat_table = ui.table(
+                        columns=crypto_strat_columns, rows=[], row_key="spec_id"
+                    ).classes("w-full").style(f"background-color: {BG_PANEL};")
+                    crypto_strat_table.add_slot("body-cell-freshness", r"""
+                        <q-td :props="props" :style="{
+                            color: props.row.freshness_age > 30 ? '""" + RED + r"""' : '""" + TEXT_PRIMARY + r"""'
+                        }">{{ props.row.freshness }}</q-td>
+                    """)
+                    crypto_strat_table.add_slot("body-cell-halted", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.halted ? '""" + RED + r"""' : '""" + GREEN + r"""',
+                                fontWeight: 'bold'
+                            }">{{ props.row.halted ? 'YES' : 'NO' }}</span>
+                        </q-td>
+                    """)
+
+                    # Per-chain table
+                    ui.label("Chains").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    crypto_chain_columns = [
+                        {"name": "chain", "label": "Chain", "field": "chain", "align": "left"},
+                        {"name": "block", "label": "Last Block", "field": "block", "align": "center"},
+                        {"name": "block_age", "label": "Age", "field": "block_age", "align": "center"},
+                        {"name": "active_specs", "label": "Active Specs", "field": "active_specs", "align": "left"},
+                    ]
+                    crypto_chain_table = ui.table(
+                        columns=crypto_chain_columns, rows=[], row_key="chain"
+                    ).classes("w-full").style(f"background-color: {BG_PANEL};")
+                    crypto_chain_table.add_slot("body-cell-block_age", r"""
+                        <q-td :props="props" :style="{
+                            color: props.row.block_age_sec > 30 ? '""" + YELLOW + r"""' : '""" + TEXT_PRIMARY + r"""'
+                        }">{{ props.row.block_age }}</q-td>
+                    """)
+
+                    # Recent fills
+                    ui.label("Recent Fills").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    crypto_fills_columns = [
+                        {"name": "timestamp", "label": "Time", "field": "timestamp", "align": "left"},
+                        {"name": "spec_id", "label": "Spec ID", "field": "spec_id", "align": "left"},
+                        {"name": "chain", "label": "Chain", "field": "chain", "align": "left"},
+                        {"name": "bundle_hash", "label": "Bundle Hash", "field": "bundle_hash", "align": "left"},
+                        {"name": "profit", "label": "Sim Profit ($)", "field": "profit", "align": "right"},
+                        {"name": "status", "label": "Status", "field": "status", "align": "center"},
+                    ]
+                    crypto_fills_table = ui.table(
+                        columns=crypto_fills_columns, rows=[], row_key="key"
+                    ).classes("w-full").style(f"background-color: {BG_PANEL};")
+                    crypto_fills_table.add_slot("body-cell-profit", r"""
+                        <q-td :props="props" :style="{
+                            color: props.row.profit_raw > 0 ? '""" + GREEN + r"""' : '""" + RED + r"""'
+                        }">{{ props.row.profit }}</q-td>
+                    """)
+
+                    # Update function for Crypto tab
+                    def update_crypto():
+                        from datetime import datetime as _dt
+                        with dashboard._lock:
+                            crypto_strategies = dict(dashboard._crypto_strategies)
+                            crypto_fills = list(dashboard._crypto_fills)[:50]
+                            crypto_chains = dict(dashboard._crypto_chains)
+
+                        # Update metrics
+                        total_fills = len(crypto_fills)
+                        total_profit = sum(f.get("simulated_profit", 0) for f in crypto_fills)
+                        fills_label.set_text(str(total_fills))
+                        profit_label.set_text(f"${total_profit:.2f}")
+
+                        # Update strategies table
+                        strat_rows = []
+                        for spec_id, spec_data in sorted(crypto_strategies.items()):
+                            age_s = time.time() - spec_data.get("last_heartbeat", time.time())
+                            strat_rows.append({
+                                "spec_id": spec_id,
+                                "chains": ", ".join(spec_data.get("chains", [])) or "—",
+                                "freshness": _fmt_age(age_s),
+                                "freshness_age": age_s,
+                                "halted": spec_data.get("halted", False),
+                                "fills": str(spec_data.get("fill_count", 0)),
+                                "last_fill": (_dt.fromtimestamp(spec_data.get("last_fill_ts", 0)).strftime("%H:%M:%S")
+                                             if spec_data.get("last_fill_ts") else "—"),
+                            })
+                        crypto_strat_table.rows = strat_rows or [{"spec_id": "—", "chains": "—", "freshness": "—", "halted": False, "fills": "0", "last_fill": "—"}]
+                        crypto_strat_table.update()
+
+                        # Update chains table
+                        chain_rows = []
+                        for chain, chain_data in sorted(crypto_chains.items()):
+                            block_age_s = time.time() - chain_data.get("last_tick", time.time())
+                            # Count active specs on this chain
+                            active_specs = [s for s, d in crypto_strategies.items()
+                                           if chain in d.get("chains", [])]
+                            chain_rows.append({
+                                "chain": chain,
+                                "block": str(chain_data.get("number", "?")),
+                                "block_age": _fmt_age(block_age_s),
+                                "block_age_sec": block_age_s,
+                                "active_specs": ", ".join(active_specs) if active_specs else "—",
+                            })
+                        crypto_chain_table.rows = chain_rows or [{"chain": "—", "block": "—", "block_age": "—", "active_specs": "—"}]
+                        crypto_chain_table.update()
+
+                        # Update fills table
+                        fill_rows = []
+                        for i, f in enumerate(crypto_fills):
+                            fill_rows.append({
+                                "key": f"{f.get('spec_id')}_{f.get('timestamp')}_{i}",
+                                "timestamp": (_dt.fromtimestamp(f.get("timestamp", 0)).strftime("%H:%M:%S")
+                                             if f.get("timestamp") else "—"),
+                                "spec_id": f.get("spec_id", "?"),
+                                "chain": f.get("chain", "?"),
+                                "bundle_hash": f.get("bundle_hash", "?")[:12] + "..." if f.get("bundle_hash") else "—",
+                                "profit": f"${f.get('simulated_profit', 0):.2f}",
+                                "profit_raw": f.get("simulated_profit", 0),
+                                "status": f.get("status", "?"),
+                            })
+                        crypto_fills_table.rows = fill_rows or [{"key": "_empty", "timestamp": "—", "spec_id": "—", "chain": "—", "bundle_hash": "—", "profit": "—", "status": "—"}]
+                        crypto_fills_table.update()
+
+                    ui.timer(1.0, update_crypto)
+
             # ---- Periodic UI update — Console tab refresh ----
             # Skipped when Console tab is disabled.
             if console_tab is not None:
