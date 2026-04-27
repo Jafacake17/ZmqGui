@@ -2268,6 +2268,13 @@ class Dashboard:
                         ibkr_quotes = dict(dashboard._ibkr_quotes)
                     broker_profiles = dashboard._broker_profiles
 
+                    # Map broker IDs to data_source keys (heartbeat uses short keys)
+                    broker_data_source_map = {
+                        "oanda-practice": "oanda",
+                        "dukascopy-demo": "dukascopy",
+                        "ibkr-pro": "ibkr",
+                    }
+
                     # Build rows: one per IBKR instrument with effective costs
                     broker_cost_new_rows = []
                     for instrument in sorted(_IBKR_INSTRUMENTS):
@@ -2278,8 +2285,9 @@ class Dashboard:
                             comm_bps = 0.0
                             mid = 0.0
 
-                            # Get current spread
-                            spread_info = broker_spreads.get(broker_id, {}).get(instrument, {})
+                            # Get current spread using mapped data_source key
+                            data_source_key = broker_data_source_map.get(broker_id)
+                            spread_info = broker_spreads.get(data_source_key, {}).get(instrument, {})
                             if spread_info:
                                 spread_bps = float(spread_info.get("spread_bps", 0))
                                 if spread_bps < 0:
