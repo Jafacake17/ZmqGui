@@ -626,6 +626,14 @@ class Dashboard:
         # Only EUR_USD, GBP_USD, USD_JPY have coverage (3-cap on free-tier depth)
         self._ibkr_quotes: dict[str, dict] = {}
 
+        # Crypto paper-trader state — per-strategy tracking
+        # {spec_id: {ts, chains, halted, last_heartbeat, fill_count}}
+        self._crypto_strategies: dict[str, dict] = {}
+        # Recent crypto fills — newest first, limited window
+        self._crypto_fills: deque[dict] = deque(maxlen=MAX_TRADE_LOG)
+        # Per-chain block ticks from feed bus {chain: {number, ts, last_tick}}
+        self._crypto_chains: dict[str, dict] = {}
+
         # ZMQ thread control
         self._zmq_running = False
         self._zmq_thread = None
@@ -747,6 +755,10 @@ class Dashboard:
                     ui.tab("Vault").style(f"color: {TEXT_PRIMARY};")
                     if cfg.tabs.get("vault", True) else None
                 )
+                crypto_tab = (
+                    ui.tab("Crypto").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("crypto", True) else None
+                )
 
             # Restore the last-selected tab across page reloads via per-browser
             # user storage. Falls back to the first enabled tab if the saved
@@ -757,6 +769,7 @@ class Dashboard:
                     ("FTMO MT5", ftmo_tab),
                     ("Arbitrage", arb_tab),
                     ("Vault", vault_tab),
+                    ("Crypto", crypto_tab),
                 ) if t is not None
             ]
             saved_tab = app.storage.user.get("active_tab")
@@ -3269,6 +3282,12 @@ class Dashboard:
         elif topic == "balance.arbitrage":
             # Arbitrage exchange balances (Betfair, Matchbook)
             self._on_balance_arbitrage(msg)
+        elif topic.startswith("block."):
+            # Crypto feed: block ticks per chain
+            self._on_crypto_block(msg, topic)
+        elif topic.startswith("heartbeat.flash-arb-") or topic.startswith("heartbeat.triangular-arb-"):
+            # Crypto strategy heartbeats (divert before generic heartbeat)
+            self._on_crypto_heartbeat(msg)
         elif topic.startswith("heartbeat."):
             self._on_heartbeat(msg)
         elif topic == "command":
@@ -3328,6 +3347,26 @@ class Dashboard:
             }
 
     def _on_fill(self, msg: dict):
+        # Check if this is a Crypto fill (has spec_id instead of strategy_id)
+        spec_id = msg.get("spec_id")
+        if spec_id:
+            # Crypto paper-trader fill
+            with self._lock:
+                self._crypto_fills.appendleft({
+                    "timestamp": msg.get("timestamp", time.time()),
+                    "spec_id": spec_id,
+                    "chain": msg.get("chain", ""),
+                    "bundle_hash": msg.get("bundle_hash", ""),
+                    "simulated_profit": msg.get("simulated_profit", 0.0),
+                    "status": msg.get("status", "paper"),
+                })
+                # Update spec's fill count
+                if spec_id in self._crypto_strategies:
+                    self._crypto_strategies[spec_id]["fill_count"] = \
+                        self._crypto_strategies[spec_id].get("fill_count", 0) + 1
+                    self._crypto_strategies[spec_id]["last_fill_ts"] = msg.get("timestamp", time.time())
+            return
+
         sid = msg.get("strategy_id", "unknown")
         symbol = msg.get("symbol", "")
         side = msg.get("side", "")
@@ -3640,6 +3679,33 @@ class Dashboard:
             sgates = msg.get("scenario_spread_gates")
             if isinstance(sgates, dict) and sgates:
                 self._scenario_spread_gates = sgates
+
+    def _on_crypto_heartbeat(self, msg: dict):
+        """Crypto paper-trader heartbeat — minimal liveness signal."""
+        spec_id = msg.get("spec_id", "")
+        if not spec_id:
+            return
+        with self._lock:
+            self._crypto_strategies[spec_id] = {
+                "spec_id": spec_id,
+                "ts": msg.get("ts", time.time()),
+                "chains": msg.get("chains", []),
+                "halted": msg.get("halted", False),
+                "last_heartbeat": time.time(),
+                "fill_count": self._crypto_strategies.get(spec_id, {}).get("fill_count", 0),
+                "last_fill_ts": self._crypto_strategies.get(spec_id, {}).get("last_fill_ts", 0),
+            }
+
+    def _on_crypto_block(self, msg: dict, topic: str):
+        """Crypto feed: block tick per chain (topic: block.<chain>)."""
+        chain = topic.split(".", 1)[1] if "." in topic else "unknown"
+        with self._lock:
+            self._crypto_chains[chain] = {
+                "chain": chain,
+                "number": msg.get("number", 0),
+                "ts": msg.get("ts", time.time()),
+                "last_tick": time.time(),
+            }
 
     def _on_command(self, msg: dict):
         action = msg.get("action", "")
