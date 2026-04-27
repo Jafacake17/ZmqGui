@@ -3405,17 +3405,14 @@ class Dashboard:
                 dedup_key = (scen_id, sid, symbol, entry_ts)
                 if dedup_key not in self._closed_trade_keys:
                     self._closed_trade_keys.add(dedup_key)
-                    final_broker = existing.get("broker_id") or broker_id
-                    logger.info(f"DEBUG: Closing {sid}/{symbol}: opener_broker={existing.get('broker_id')}, closer_broker={broker_id}, final={final_broker}")
                     self._closed_trades.appendleft({
                         "scenario_id": scen_id,
                         "strategy_id": sid,
                         "symbol": symbol,
-                        # Broker is the opener's venue — a closing
-                        # fill from a different broker would be a bug,
-                        # but we defensively fall back to the closer's
-                        # broker_id if the opener didn't record one.
-                        "broker_id": final_broker,
+                        # Broker from opener; fall back to closer if opener
+                        # doesn't have it. Historical pre-2026-04-22 data may
+                        # have empty broker_id, showing as "—".
+                        "broker_id": existing.get("broker_id") or broker_id,
                         "side": existing["side"],
                         "quantity": close_qty,
                         "entry_ts": entry_ts,
