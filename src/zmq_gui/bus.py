@@ -60,4 +60,7 @@ class Bus:
         arb_scanner before send_multipart).
         """
         frames = socket.recv_multipart(flags=flags)
-        return json.loads(frames[1])
+        body = json.loads(frames[1])
+        if "topic" not in body:
+            body["topic"] = frames[0].decode("utf-8", errors="replace")
+        return body
