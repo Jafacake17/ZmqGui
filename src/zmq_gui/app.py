@@ -287,6 +287,9 @@ def _build_strategy_rows(strategies: dict,
                 "_entry_trace": etbs.get(sym),
                 "_filter_trace": ftbs.get(sym),
                 "_filter_block": fbbs.get(sym),
+                # Strategy-level spec metadata is shared across all symbols
+                "_spec_conditions": info.get("_spec_conditions"),
+                "_spec_filters": info.get("_spec_filters"),
             }
             rows.append({
                 "strategy_symbol": f"{sid}::{sym}",
@@ -399,10 +402,10 @@ def _build_condition_chips(info: dict) -> list[dict]:
     spec_filters = info.get("_spec_filters") or []
 
     if spec_filters:
-        # Use spec_filters as canonical list, match against filter_trace
+        # Use spec_filters as canonical list, match against filter_trace.
+        # Heartbeat spec_filters use "type" as the filter name key.
         for spec in spec_filters:
-            fname = spec.get("label", "?")
-            threshold = spec.get("threshold", "?")
+            fname = spec.get("type", spec.get("label", "?"))
 
             # Look up state in filter_trace
             passed = None
@@ -454,10 +457,25 @@ def _build_condition_chips(info: dict) -> list[dict]:
     # Otherwise fall back to whatever's in entry_trace.
     if spec_conds:
         for spec in spec_conds:
-            label = spec.get("label", "?")
-            threshold = spec.get("threshold", "?")
-            op = spec.get("operator", "")
-            full_label = label
+            # Heartbeat spec_conditions use type/name/field/op/value keys.
+            # Build the entry_trace lookup key and display name from them.
+            ctype = spec.get("type", "")
+            if ctype in ("indicator", "indicator_cross"):
+                cname = spec.get("name", "?")
+                full_label = f"{ctype}.{cname}"
+                display_name = _short_cond_label(full_label)
+            elif ctype == "price":
+                field = spec.get("field", "mid")
+                val = spec.get("value", "?")
+                full_label = f"price.{field}:{val}"
+                display_name = f"price.{field}"
+            else:
+                # Unknown type or legacy dict with explicit "label" key
+                full_label = spec.get("label", spec.get("name", ctype or "?"))
+                display_name = _short_cond_label(full_label)
+
+            op = spec.get("op", spec.get("operator", ""))
+            threshold = spec.get("value", spec.get("threshold", "?"))
 
             # Look up current state in entry_trace
             entry = conds.get(full_label, {})
@@ -469,15 +487,13 @@ def _build_condition_chips(info: dict) -> list[dict]:
             elif passed is False:
                 color = RED
             else:
-                # None means warming up or not yet evaluated
                 color = YELLOW
 
-            name = _short_cond_label(label)
             if passed is None:
-                chips.append({"label": f"{name}: warming up", "color": color})
+                chips.append({"label": f"{display_name}: warming up", "color": color})
             else:
                 chips.append({
-                    "label": f"{name}: {obs} {op} {threshold}",
+                    "label": f"{display_name}: {obs} {op} {threshold}",
                     "color": color,
                 })
     elif conds:
