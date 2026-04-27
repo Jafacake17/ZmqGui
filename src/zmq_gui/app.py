@@ -151,24 +151,25 @@ def _calc_commission_bps(commission_rate: float, extra_comm: float, mid: float, 
                          commission_model: str = "per_unit") -> float:
     """
     Calculate round-trip commission in basis points.
-    Formula from deployment_router._pick_best_spread_target:
-    - per_unit: (qty * commission_rate * 2) / mid * 10000
-    - notional_pct: (qty * mid * commission_rate * 2) / (mid * qty) * 10000 = commission_rate * 2 * 10000
-    Plus: (extra_comm * 2) / mid * 10000
+    Both models return qty-invariant percentages-of-notional.
+    - per_unit: commission_rate is per unit of base; compute as % of mid
+    - notional_pct: commission_rate is already a % of notional
+    Extra flat per-trade fee scales inversely with size (divide by notional).
     """
-    comm_bps = 0.0
-    if qty > 0 and mid > 0:
-        if commission_model == "notional_pct":
-            # commission_rate is already a % of notional
-            comm_bps = commission_rate * 2 * 10_000
-        else:
-            # per_unit: qty * rate (in quote currency)
-            comm_per_fill = qty * commission_rate
-            comm_bps = (comm_per_fill * 2 / mid) * 10_000
+    if qty <= 0 or mid <= 0:
+        return 0.0
 
-        # Add flat per-trade fee
-        if extra_comm > 0:
-            comm_bps += (extra_comm * 2 / mid) * 10_000
+    if commission_model == "notional_pct":
+        # commission_rate is already a % of notional
+        comm_bps = commission_rate * 2 * 10_000
+    else:
+        # per_unit: rate is in quote currency per unit base
+        # qty cancels out in the ratio, result is qty-invariant
+        comm_bps = (commission_rate * 2 / mid) * 10_000
+
+    # Flat per-trade fee (dollars): scales inversely with notional size
+    if extra_comm > 0:
+        comm_bps += (extra_comm * 2 / (mid * qty)) * 10_000
 
     return comm_bps
 
