@@ -16,6 +16,8 @@ sources:
   - tcp://127.0.0.1:5552
   # Arbitrage scanner sidecar (arb.scan snapshots, arb heartbeats).
   - tcp://127.0.0.1:5562
+  # Economic calendar health alarms (stale/degraded/rotted).
+  - tcp://127.0.0.1:5567
 
 # Separate PUB socket for tick prices (used by Open Trades to show
 # unrealised P&L). Optional — leave null to disable the feed.

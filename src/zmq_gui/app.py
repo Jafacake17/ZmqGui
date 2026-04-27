@@ -647,6 +647,11 @@ class Dashboard:
         # Mode label (e.g. "live" / "paper") — updated from heartbeat.
         self._mode: str = "--"
 
+        # Economic calendar health alarm — set when alert.econ_calendar.*
+        # arrives; cleared (set to None) if > 2h old at render time.
+        self._econ_cal_alarm: dict | None = None
+        self._econ_cal_alarm_ts: float = 0.0
+
         # Open trades — keyed by (strategy_id, symbol). An entry fill
         # opens a position; a closing fill (opposite side, same key)
         # removes it. Also synced authoritatively from heartbeat's
@@ -767,6 +772,7 @@ class Dashboard:
                 pnl_label = ui.label("Daily P&L: --").style(f"color: {GREEN};")
                 strat_label = ui.label("Strategies: 0").style(f"color: {TEXT_SECONDARY};")
                 clock_label = ui.label("").style(f"color: {TEXT_SECONDARY};")
+                cal_label = ui.label("Calendar: OK").style(f"color: {GREEN}; font-size: 12px;")
 
             # Alert banner (hidden by default)
             alert_label = ui.label("").style(
@@ -2892,6 +2898,34 @@ class Dashboard:
 
                 ui.timer(1.0, update_ui)
 
+            # ---- Calendar health badge — runs regardless of active tab ----
+            # 2h TTL: if no alarm has arrived in 2h, show OK (alarms only
+            # fire when health tool finds a problem; silence = healthy).
+            _ECON_CAL_ALARM_TTL = 7200
+
+            def update_cal_badge():
+                with dashboard._lock:
+                    alarm = dashboard._econ_cal_alarm
+                    alarm_ts = dashboard._econ_cal_alarm_ts
+                if alarm is None or (time.time() - alarm_ts > _ECON_CAL_ALARM_TTL):
+                    cal_label.set_text("Calendar: OK")
+                    cal_label.style(replace=f"color: {GREEN}; font-size: 12px;")
+                else:
+                    verdict = alarm.get("verdict", "?")
+                    age = _fmt_age(time.time() - alarm_ts)
+                    reasons = alarm.get("reasons") or []
+                    first_reason = reasons[0][:50] if reasons else ""
+                    cal_color = RED if verdict in ("STALE", "ROTTED") else YELLOW
+                    cal_label.set_text(
+                        f"Calendar: {verdict} ({age}) — {first_reason}"
+                        if first_reason else f"Calendar: {verdict} ({age})"
+                    )
+                    cal_label.style(
+                        replace=f"color: {cal_color}; font-weight: bold; font-size: 12px;"
+                    )
+
+            ui.timer(5.0, update_cal_badge)
+
         # ------------------------------------------------------------------
         # Chart routes — /chart/<trade_id> and /chart/legacy/<sid>/<sym>
         # ------------------------------------------------------------------
@@ -3500,6 +3534,8 @@ class Dashboard:
             self._on_command(msg)
         elif topic.startswith("arb."):
             self._on_arb_scan(msg)
+        elif topic.startswith("alert.econ_calendar."):
+            self._on_econ_calendar_alert(msg)
 
     # -- handlers (ported verbatim from ModularTradeApp GUI) -----------
 
@@ -3551,6 +3587,12 @@ class Dashboard:
                 "ts":       msg.get("ts", ""),
                 "_received": time.time(),
             }
+
+    def _on_econ_calendar_alert(self, msg: dict):
+        """Economic calendar health alarm (alert.econ_calendar.stale/degraded/rotted)."""
+        with self._lock:
+            self._econ_cal_alarm = msg
+            self._econ_cal_alarm_ts = time.time()
 
     def _on_fill(self, msg: dict):
         # Check if this is a Crypto fill (has spec_id instead of strategy_id)
