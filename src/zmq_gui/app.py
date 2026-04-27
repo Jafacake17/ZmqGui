@@ -391,12 +391,40 @@ def _build_condition_chips(info: dict) -> list[dict]:
     """
     chips: list[dict] = []
 
-    # Filters — one chip per filter, ordered as they appear in the spec.
-    # Prefer the new filter_trace (full list); fall back to the legacy
-    # single filter_block for backward compatibility with older plugin
-    # builds still on the old harness.
+    # Filters — render spec_filters with state from filter_trace,
+    # or fall back to filter_trace / filter_block directly.
     ftrace = info.get("_filter_trace")
-    if ftrace:
+    fb = info.get("_filter_block")
+    spec_filters = info.get("_spec_filters") or []
+
+    if spec_filters:
+        # Use spec_filters as canonical list, match against filter_trace
+        for spec in spec_filters:
+            fname = spec.get("label", "?")
+            threshold = spec.get("threshold", "?")
+
+            # Look up state in filter_trace
+            passed = None
+            detail = ""
+            if ftrace:
+                for entry in ftrace:
+                    if entry.get("filter", "") == fname:
+                        passed = entry.get("passed")
+                        detail = entry.get("detail", "")
+                        break
+            # If not in filter_trace but there's a filter_block, check if it matches
+            elif fb and fb.get("filter", "") == fname:
+                passed = False
+                detail = fb.get("detail", "")
+
+            color = GREEN if passed is True else RED if passed is False else YELLOW
+
+            if detail:
+                chips.append({"label": f"{fname}: {detail}", "color": color})
+            else:
+                chips.append({"label": fname, "color": color})
+    elif ftrace:
+        # Fall back to filter_trace
         for entry in ftrace:
             passed = entry.get("passed")
             color = GREEN if passed else RED
@@ -406,21 +434,53 @@ def _build_condition_chips(info: dict) -> list[dict]:
                 "label": f"{fname}: {detail}" if detail else fname,
                 "color": color,
             })
-    else:
-        fb = info.get("_filter_block")
-        if fb:
-            chips.append({
-                "label": f"blocked by {fb.get('filter', '?')}: {fb.get('detail', '')}",
-                "color": RED,
-            })
+    elif fb:
+        # Fall back to filter_block (legacy path)
+        chips.append({
+            "label": f"blocked by {fb.get('filter', '?')}: {fb.get('detail', '')}",
+            "color": RED,
+        })
 
-    # Entry conditions — only meaningful when all filters pass; when
-    # filters are blocking, the entry trace is stale but still
-    # informative (shows what the condition WOULD have evaluated to).
-    # A separator makes the two groups easier to read.
+    # Entry conditions — render spec_conditions with their current state
+    # from entry_trace, or fall back to the entry_trace data directly.
+    # Spec conditions are static metadata; entry_trace provides runtime state.
     trace = info.get("_entry_trace") or {}
     conds = trace.get("conditions") or {}
-    if conds:
+    spec_conds = info.get("_spec_conditions") or []
+
+    # If we have spec_conditions, use them as the canonical list
+    # (ensures we show all expected conditions, even if not yet evaluated).
+    # Otherwise fall back to whatever's in entry_trace.
+    if spec_conds:
+        for spec in spec_conds:
+            label = spec.get("label", "?")
+            threshold = spec.get("threshold", "?")
+            op = spec.get("operator", "")
+            full_label = label
+
+            # Look up current state in entry_trace
+            entry = conds.get(full_label, {})
+            passed = entry.get("passed")
+            obs = _fmt_trace_num(entry.get("observed"))
+
+            if passed is True:
+                color = GREEN
+            elif passed is False:
+                color = RED
+            else:
+                # None means warming up or not yet evaluated
+                color = YELLOW
+
+            name = _short_cond_label(label)
+            if passed is None:
+                chips.append({"label": f"{name}: warming up", "color": color})
+            else:
+                chips.append({
+                    "label": f"{name}: {obs} {op} {threshold}",
+                    "color": color,
+                })
+    elif conds:
+        # Fall back to entry_trace conditions (legacy path)
         for full_label, entry in conds.items():
             passed = entry.get("passed")
             if passed is True:
@@ -3529,6 +3589,15 @@ class Dashboard:
                 # would keep a dead symbol forever.
                 info["_filter_blocks_by_symbol"] = dict(
                     msg["filter_blocks_by_symbol"] or {})
+
+            # Specification conditions and filters — arrays of condition
+            # metadata (label, operator, threshold) and filter metadata
+            # (label, threshold). These are static per strategy, stashed
+            # for rendering as two distinct sections in the Conditions column.
+            if "spec_conditions" in msg:
+                info["_spec_conditions"] = msg["spec_conditions"] or []
+            if "spec_filters" in msg:
+                info["_spec_filters"] = msg["spec_filters"] or []
 
             # Scenario membership — orchestrator's authoritative list
             # of {scenario: [strategies]}. Stash globally (not per
