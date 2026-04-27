@@ -3047,6 +3047,26 @@ class Dashboard:
                         "tp": float(tp) if tp is not None else 0.0,
                         "broker": broker or "",
                     })
+            # Populate _open_trades with any remaining open positions from
+            # the backfill. This allows live closers to match against
+            # historical openers, enabling proper broker_id propagation.
+            for (scen, strat, sym), book in open_positions.items():
+                for fill in book:
+                    key = (strat, sym)
+                    if key not in self._open_trades:
+                        self._open_trades[key] = {
+                            "strategy": strat,
+                            "symbol": sym,
+                            "side": fill["side"],
+                            "broker_id": fill.get("broker", ""),
+                            "entry_price": fill["px"],
+                            "quantity": fill["qty"],
+                            "stop_loss": fill.get("sl", 0),
+                            "take_profit": fill.get("tp", 0),
+                            "timeout_seconds": 0,
+                            "entry_ts": fill["ts"],
+                        }
+
         logger.info(
             "Seeded %d historical fills + %d closed trades from QuestDB",
             seeded, closed_count,
