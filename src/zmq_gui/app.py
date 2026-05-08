@@ -97,6 +97,37 @@ _IBKR_INSTRUMENTS = {"EUR_USD", "GBP_USD", "USD_JPY"}
 
 
 # ---------------------------------------------------------------------- #
+# Economic calendar state persistence
+# ---------------------------------------------------------------------- #
+
+_ECON_CAL_STATE_PATH = Path.home() / ".config" / "zmqgui" / "econ_cal_state.json"
+_ECON_CAL_STATE_TTL = 86400  # 24 h — beyond this the persisted OK is ignored
+
+
+def _load_econ_cal_state() -> tuple[float, dict | None]:
+    """Return (ok_ts, ok_msg) from disk, or (0.0, None) if absent/stale/corrupt."""
+    try:
+        data = json.loads(_ECON_CAL_STATE_PATH.read_text())
+        ok_ts = float(data["ok_ts"])
+        if time.time() - ok_ts > _ECON_CAL_STATE_TTL:
+            return 0.0, None
+        return ok_ts, data.get("ok_msg")
+    except Exception:
+        return 0.0, None
+
+
+def _save_econ_cal_state(ok_ts: float, ok_msg: dict) -> None:
+    """Atomically persist the last calendar OK heartbeat to disk."""
+    try:
+        _ECON_CAL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _ECON_CAL_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"ok_ts": ok_ts, "ok_msg": ok_msg}))
+        tmp.rename(_ECON_CAL_STATE_PATH)
+    except Exception as exc:
+        logger.warning("Failed to persist econ_cal_state: %s", exc)
+
+
+# ---------------------------------------------------------------------- #
 # Broker cost profile loading
 # ---------------------------------------------------------------------- #
 
@@ -172,6 +203,51 @@ def _calc_commission_bps(commission_rate: float, extra_comm: float, mid: float, 
         comm_bps += (extra_comm * 2 / (mid * qty)) * 10_000
 
     return comm_bps
+
+
+def _tick_mid(tick_prices: dict, symbol: str) -> float:
+    data = tick_prices.get(symbol) or tick_prices.get(symbol.upper())
+    if not data:
+        return 0.0
+    bid = float(data.get("bid") or 0)
+    ask = float(data.get("ask") or 0)
+    if bid > 0 and ask > bid:
+        return (bid + ask) / 2.0
+    return float(bid or ask or 0)
+
+
+def _to_gbp(pnl_quote: float, symbol: str, tick_prices: dict) -> float:
+    """Convert P&L from a pair's quote currency into GBP account currency.
+
+    FX P&L is naturally in the quote currency: (exit − entry) × size gives
+    USD for *_USD pairs and JPY for *_JPY pairs. Without conversion the
+    dashboard over-states JPY P&L by ~190× (JPY/GBP ≈ 190).
+
+    Conversion factors:
+      quote=GBP → 1.0 (already home currency)
+      quote=USD → divide by GBP_USD mid
+      quote=JPY → divide by GBP_JPY synthetic (= GBP_USD × USD_JPY)
+
+    Falls back to 1.0 (no conversion) when the required rates are absent
+    from tick_prices — this preserves old behaviour for symbols not covered
+    by the live feed rather than silently zeroing P&L.
+    """
+    parts = symbol.upper().split("_")
+    if len(parts) != 2:
+        return pnl_quote
+    quote = parts[1]
+    if quote == "GBP":
+        return pnl_quote
+    if quote == "USD":
+        gbp_usd = _tick_mid(tick_prices, "GBP_USD")
+        if gbp_usd > 0:
+            return pnl_quote / gbp_usd
+    elif quote == "JPY":
+        gbp_usd = _tick_mid(tick_prices, "GBP_USD")
+        usd_jpy = _tick_mid(tick_prices, "USD_JPY")
+        if gbp_usd > 0 and usd_jpy > 0:
+            return pnl_quote / (gbp_usd * usd_jpy)
+    return pnl_quote
 
 
 # ---------------------------------------------------------------------- #
@@ -285,6 +361,8 @@ def _build_strategy_rows(strategies: dict,
             })
             continue
 
+        ci_strat = info.get("_current_indicators") or {}
+        cibs = info.get("_current_indicators_by_symbol") or {}
         for sym in symbols:
             per = {
                 "_entry_trace": etbs.get(sym),
@@ -293,6 +371,8 @@ def _build_strategy_rows(strategies: dict,
                 # Strategy-level spec metadata is shared across all symbols
                 "_spec_conditions": info.get("_spec_conditions"),
                 "_spec_filters": info.get("_spec_filters"),
+                # Per-symbol current_indicators (falls back to strategy-level)
+                "_current_indicators": cibs.get(sym, ci_strat),
             }
             wc, wt = _warming_count(per)
             rows.append({
@@ -458,35 +538,100 @@ def _build_condition_chips(info: dict) -> list[dict]:
     conds = trace.get("conditions") or {}
     spec_conds = info.get("_spec_conditions") or []
 
+    # When a filter is blocking and entry eval didn't run, show spec conditions
+    # as grey "pending" chips (name: — op threshold) rather than suppressing
+    # them entirely. This preserves condition structure visibility for the
+    # operator without implying the indicator is warming up or has failed.
+    filter_blocked_no_data = bool(not conds and fb and fb.get("filter"))
+
     # If we have spec_conditions, use them as the canonical list
     # (ensures we show all expected conditions, even if not yet evaluated).
     # Otherwise fall back to whatever's in entry_trace.
     if spec_conds:
         for spec in spec_conds:
             # Heartbeat spec_conditions use type/name/field/op/value keys.
-            # Build the entry_trace lookup key and display name from them.
+            # Build the entry_trace lookup key, current_indicators lookup key,
+            # and display name for each condition type.
             ctype = spec.get("type", "")
             if ctype in ("indicator", "indicator_cross"):
                 cname = spec.get("name", "?")
                 full_label = f"{ctype}.{cname}"
                 display_name = _short_cond_label(full_label)
+                # indicator_cross collapses to indicator.* in current_indicators
+                ci_key = f"indicator.{cname}"
             elif ctype == "price":
                 field = spec.get("field", "mid")
                 val = spec.get("value", "?")
                 full_label = f"price.{field}:{val}"
                 display_name = f"price.{field}"
+                ci_key = f"price.{field}"
+            elif ctype == "time":
+                field = spec.get("field", "?")
+                full_label = f"time.{field}"
+                display_name = full_label
+                ci_key = full_label
             else:
                 # Unknown type or legacy dict with explicit "label" key
                 full_label = spec.get("label", spec.get("name", ctype or "?"))
                 display_name = _short_cond_label(full_label)
+                ci_key = full_label
 
             op = spec.get("op", spec.get("operator", ""))
             threshold = spec.get("value", spec.get("threshold", "?"))
 
-            # Look up current state in entry_trace
-            entry = conds.get(full_label, {})
+            # When the filter blocked entry eval, use current_indicators (new
+            # field from orchestrator) for live observed values. If the field
+            # is present for this condition, render amber (blocked but live
+            # data). If absent, fall back to grey em-dash (blocked, no data).
+            if filter_blocked_no_data:
+                ci = info.get("_current_indicators") or {}
+
+                # Resolve RHS: if threshold is a named indicator ref
+                # (e.g. "donchian_upper_d1"), look it up in current_indicators
+                # so both sides are numeric in the chip label.
+                try:
+                    float(str(threshold))
+                    rhs = threshold
+                except (ValueError, TypeError):
+                    rhs = ci.get(f"indicator.{threshold}", threshold)
+
+                try:
+                    display_thr = _fmt_trace_num(float(str(rhs)))
+                except (ValueError, TypeError):
+                    display_thr = str(rhs)
+
+                obs_raw = ci.get(ci_key)
+                if obs_raw is not None:
+                    chips.append({
+                        "label": f"{display_name}: {_fmt_trace_num(obs_raw)} {op} {display_thr}",
+                        "color": "#e08c3c",  # amber — filter-blocked but live value
+                    })
+                else:
+                    chips.append({
+                        "label": f"{display_name}: — {op} {display_thr}",
+                        "color": TEXT_SECONDARY,
+                    })
+                continue
+
+            # Look up current state in entry_trace.
+            # Price conditions with numeric thresholds: entry_trace stores the
+            # unqualified key "price.mid" (not "price.mid:160.5"), so try
+            # display_name as a fallback. Named-ref thresholds ("donchian_upper_h1")
+            # produce full_label == "price.mid:donchian_upper_h1" which IS the
+            # entry_trace key and hits on the first try — display_name fallback
+            # is never reached. For indicator conditions with named refs, MTA
+            # qualifies as "indicator.{name}:{ref}" — try the double-qualified form.
+            entry = (conds.get(full_label)
+                     or (conds.get(display_name) if ctype == "price" else None)
+                     or conds.get(f"{full_label}:{threshold}")
+                     or {})
             passed = entry.get("passed")
             obs = _fmt_trace_num(entry.get("observed"))
+            # Prefer the resolved numeric threshold from entry_trace over
+            # the spec's raw value (which may be a formula name like
+            # "donchian_upper_h1" — MTA resolves it; we just need to display
+            # the resolved number, not the formula string).
+            display_thr = _fmt_trace_num(entry.get("threshold", threshold))
 
             if passed is True:
                 color = GREEN
@@ -499,7 +644,7 @@ def _build_condition_chips(info: dict) -> list[dict]:
                 chips.append({"label": f"{display_name}: warming up", "color": color})
             else:
                 chips.append({
-                    "label": f"{display_name}: {obs} {op} {threshold}",
+                    "label": f"{display_name}: {obs} {op} {display_thr}",
                     "color": color,
                 })
     elif conds:
@@ -653,8 +798,11 @@ class Dashboard:
         # _econ_cal_ok_msg: last .ok payload (carries last_successful_fetch_age_sec)
         self._econ_cal_alarm: dict | None = None
         self._econ_cal_alarm_ts: float = 0.0
-        self._econ_cal_ok_ts: float = 0.0
-        self._econ_cal_ok_msg: dict | None = None
+        _ok_ts, _ok_msg = _load_econ_cal_state()
+        self._econ_cal_ok_ts: float = _ok_ts
+        self._econ_cal_ok_msg: dict | None = _ok_msg
+        if _ok_ts:
+            logger.info("Loaded persisted calendar OK state (age %.0fs)", time.time() - _ok_ts)
 
         # Open trades — keyed by (strategy_id, symbol). An entry fill
         # opens a position; a closing fill (opposite side, same key)
@@ -680,6 +828,13 @@ class Dashboard:
         self._crypto_fills: deque[dict] = deque(maxlen=MAX_TRADE_LOG)
         # Per-chain block ticks from feed bus {chain: {number, ts, last_tick}}
         self._crypto_chains: dict[str, dict] = {}
+
+        # MFE/MAE cache — keyed by (strategy_id, symbol, entry_ts).
+        # Values: dict with mfe_bps/mae_bps, or None while pending.
+        self._mfe_mae_cache: dict = {}
+        # Queue of closed-trade dicts waiting for MFE/MAE computation.
+        # Background thread drains it via psycopg2 queries on QuestDB.
+        self._mfe_mae_queue: list = []
 
         # ZMQ thread control
         self._zmq_running = False
@@ -807,6 +962,10 @@ class Dashboard:
                     ui.tab("Crypto").style(f"color: {TEXT_PRIMARY};")
                     if cfg.tabs.get("crypto", True) else None
                 )
+                vuln_tab = (
+                    ui.tab("Vuln").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("vuln", True) else None
+                )
 
             # Restore the last-selected tab across page reloads via per-browser
             # user storage. Falls back to the first enabled tab if the saved
@@ -818,6 +977,7 @@ class Dashboard:
                     ("Arbitrage", arb_tab),
                     ("Vault", vault_tab),
                     ("Crypto", crypto_tab),
+                    ("Vuln", vuln_tab),
                 ) if t is not None
             ]
             saved_tab = app.storage.user.get("active_tab")
@@ -1209,6 +1369,7 @@ class Dashboard:
                         {"name": "take_profit", "label": "TP", "field": "take_profit", "align": "right", "sortable": True},
                         {"name": "exit_time", "label": "Exit Time", "field": "exit_time", "align": "left", "sortable": True, "sort": "numeric"},
                         {"name": "exit_price", "label": "Exit", "field": "exit_price", "align": "right", "sortable": True},
+                        {"name": "geometry", "label": "MFE:TP:Act:SL:MAE (bps)", "field": "geometry", "align": "right", "sortable": False},
                         {"name": "pnl_pct", "label": "P&L %", "field": "pnl_pct", "align": "right", "sortable": True, "sort": "numeric"},
                         {"name": "pnl", "label": "P&L", "field": "pnl", "align": "right", "sortable": True, "sort": "numeric"},
                     ]
@@ -1240,6 +1401,23 @@ class Dashboard:
                                      : props.row.pnl_raw < 0 ? '""" + RED + r"""'
                                      : '""" + TEXT_SECONDARY + r"""',
                             }">{{ props.row.pnl_pct }}</span>
+                        </q-td>
+                    """)
+                    recent_trades_table.add_slot("body-cell-geometry", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                fontFamily: 'monospace',
+                                fontSize: '12px'
+                            }">{{ props.row.geometry }}</span>
+                        </q-td>
+                    """)
+                    recent_trades_table.add_slot("body-cell-exit_price", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.exit_reason === 'tp' ? '""" + GREEN + r"""'
+                                     : props.row.exit_reason === 'sl' ? '""" + RED + r"""'
+                                     : '""" + TEXT_PRIMARY + r"""'
+                            }">{{ props.row.exit_price }}</span>
                         </q-td>
                     """)
 
@@ -2442,6 +2620,144 @@ class Dashboard:
 
                     ui.timer(1.0, update_crypto)
 
+              # ================ VULN SEARCHER TAB ================
+              if vuln_tab is not None:
+                with ui.tab_panel(vuln_tab):
+                    _VULN_SEV_COLORS = {
+                        "critical": RED,
+                        "high":     "#e0823c",
+                        "medium":   YELLOW,
+                        "low":      GREEN,
+                        "info":     BLUE,
+                        "unknown":  TEXT_SECONDARY,
+                    }
+                    _VULN_CATS = ["All", "vulnerability", "breach", "fine", "news",
+                                  "advisory", "geopolitical", "financial"]
+                    _VULN_SEVS = ["All", "critical", "high", "medium", "low",
+                                  "info", "unknown"]
+
+                    ui.label("Adverse Intelligence").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+
+                    with ui.row().classes("w-full gap-4 items-end mt-2 flex-wrap"):
+                        vuln_entity = ui.input(
+                            label="Entity / vendor",
+                            placeholder="fortinet, microsoft, …",
+                        ).style("min-width: 200px;")
+                        vuln_cat = ui.select(
+                            _VULN_CATS, value="All", label="Category",
+                        ).style("min-width: 140px;")
+                        vuln_sev = ui.select(
+                            _VULN_SEVS, value="All", label="Severity",
+                        ).style("min-width: 120px;")
+                        vuln_days = ui.number(
+                            "Days back", value=30, min=1, max=730, step=1,
+                        ).style("width: 100px;")
+                        vuln_btn = ui.button("Search").style(
+                            f"background-color: {BLUE}; color: white;"
+                        )
+
+                    vuln_status = ui.label("").style(
+                        f"color: {TEXT_SECONDARY}; font-size: 12px; margin-top: 4px;"
+                    )
+
+                    vuln_table = ui.table(
+                        columns=[
+                            {"name": "published_at", "label": "Published",   "field": "published_at", "align": "left",  "sortable": True},
+                            {"name": "source",       "label": "Source",      "field": "source",       "align": "left",  "sortable": True},
+                            {"name": "category",     "label": "Category",    "field": "category",     "align": "left",  "sortable": True},
+                            {"name": "severity",     "label": "Severity",    "field": "severity",     "align": "center","sortable": True},
+                            {"name": "title",        "label": "Title",       "field": "title",        "align": "left",  "sortable": False},
+                            {"name": "entities",     "label": "Entities",    "field": "entities",     "align": "left",  "sortable": False},
+                            {"name": "url",          "label": "URL",         "field": "url",          "align": "left",  "sortable": False},
+                        ],
+                        rows=[],
+                        row_key="row_key",
+                        pagination={"rowsPerPage": 50},
+                    ).classes("w-full mt-2")
+
+                    vuln_table.add_slot("body-cell-severity", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.sev_color,
+                                fontWeight: 'bold',
+                                fontSize: '12px',
+                                textTransform: 'uppercase',
+                            }">{{ props.row.severity }}</span>
+                        </q-td>
+                    """)
+                    vuln_table.add_slot("body-cell-url", r"""
+                        <q-td :props="props">
+                            <a :href="props.row.url" target="_blank"
+                               :style="{color: '""" + BLUE + r"""', fontSize: '12px'}">
+                                {{ props.row.url ? 'link' : '' }}
+                            </a>
+                        </q-td>
+                    """)
+
+                    def run_vuln_search():
+                        import psycopg2
+                        entity_val = (vuln_entity.value or "").strip()
+                        cat_val    = vuln_cat.value or "All"
+                        sev_val    = vuln_sev.value or "All"
+                        days_val   = int(vuln_days.value or 30)
+
+                        wheres = [f"published_at > dateadd('d', -{days_val}, now())"]
+                        params: list = []
+                        if entity_val:
+                            wheres.append("entities LIKE %s")
+                            params.append(f"%{entity_val.lower()}%")
+                        if cat_val != "All":
+                            wheres.append("category = %s")
+                            params.append(cat_val)
+                        if sev_val != "All":
+                            wheres.append("severity = %s")
+                            params.append(sev_val)
+
+                        sql = (
+                            "SELECT published_at, source, category, severity, "
+                            "title, url, entities "
+                            "FROM adverse_intel "
+                            f"WHERE {' AND '.join(wheres)} "
+                            "ORDER BY published_at DESC LIMIT 200"
+                        )
+                        try:
+                            with psycopg2.connect(
+                                host="localhost", port=8812,
+                                user="admin", password="quest", dbname="qdb",
+                            ) as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute(sql, params or None)
+                                    raw_rows = cur.fetchall()
+                        except Exception as exc:
+                            vuln_status.set_text(f"Query error: {exc}")
+                            return
+
+                        new_rows = []
+                        for i, (pub, src, cat_r, sev_r, title, url, ents) in enumerate(raw_rows):
+                            pub_str = (
+                                pub.strftime("%Y-%m-%d %H:%M")
+                                if hasattr(pub, "strftime") else str(pub)[:16]
+                            )
+                            new_rows.append({
+                                "row_key":    str(i),
+                                "published_at": pub_str,
+                                "source":     src or "",
+                                "category":   cat_r or "",
+                                "severity":   sev_r or "",
+                                "sev_color":  _VULN_SEV_COLORS.get(sev_r or "", TEXT_SECONDARY),
+                                "title":      title or "",
+                                "url":        url or "",
+                                "entities":   (ents or "")[:100],
+                            })
+                        vuln_status.set_text(f"{len(new_rows)} result(s) — last {days_val}d")
+                        vuln_table.rows = new_rows
+                        vuln_table.update()
+
+                    vuln_btn.on("click", lambda _: run_vuln_search())
+                    ui.timer(0, run_vuln_search, once=True)
+
             # ---- Periodic UI update — Console tab refresh ----
             # Skipped when Console tab is disabled.
             if console_tab is not None:
@@ -2461,6 +2777,7 @@ class Dashboard:
                         open_trades = dict(dashboard._open_trades)
                         closed_trades = list(dashboard._closed_trades)
                         tick_prices = dict(dashboard._tick_prices)
+                        mfe_mae_cache = dict(dashboard._mfe_mae_cache)
                         scenarios = {
                             k: {
                                 "status": v.get("status"),
@@ -2687,9 +3004,9 @@ class Dashboard:
                         # negative (you're behind by the cost to exit).
                         if cur_price > 0 and entry_px > 0 and qty > 0:
                             if ot.get("side") == "buy":
-                                gross = (cur_price - entry_px) * qty
+                                gross = _to_gbp((cur_price - entry_px) * qty, sym, tick_prices)
                             else:
-                                gross = (entry_px - cur_price) * qty
+                                gross = _to_gbp((entry_px - cur_price) * qty, sym, tick_prices)
                             rt_cost = 2.0 * opener_comm
                             pnl_raw = gross - rt_cost
                             pnl_str = (f"+{pnl_raw:.2f}" if pnl_raw >= 0
@@ -2863,6 +3180,41 @@ class Dashboard:
                             tp_v = float(t.get("take_profit") or 0)
                             sl_str = f"{sl_v:{fmt}}" if sl_v > 0 else "--"
                             tp_str = f"{tp_v:{fmt}}" if tp_v > 0 else "--"
+                            mm_key = (t.get("strategy_id",""), t.get("symbol",""), e_ts)
+                            mm = mfe_mae_cache.get(mm_key)
+                            side = (t.get("side") or "").upper()
+                            direction_sign = +1 if side == "BUY" else -1 if side == "SELL" else 0
+                            def _to_bps(level):
+                                if not level or not entry_px:
+                                    return None
+                                return (level - entry_px) / entry_px * 1e4 * direction_sign
+                            if mm:
+                                mfe_bps = mm["mfe_bps"]
+                                mae_bps = mm["mae_bps"]
+                            else:
+                                mfe_bps = None
+                                mae_bps = None
+                            tp_bps = _to_bps(tp_v) if tp_v > 0 else None
+                            sl_bps = _to_bps(sl_v) if sl_v > 0 else None
+                            actual_bps = pnl_pct * 100
+                            def _fmt_bps(v):
+                                if v is None:
+                                    return "--"
+                                return f"+{v:.1f}" if v >= 0 else f"{v:.1f}"
+                            geometry_str = " : ".join([
+                                _fmt_bps(mfe_bps),
+                                _fmt_bps(tp_bps),
+                                _fmt_bps(actual_bps),
+                                _fmt_bps(sl_bps),
+                                _fmt_bps(mae_bps),
+                            ])
+                            _tol = max(entry_px, 1e-9) * 1e-4
+                            if tp_v > 0 and abs(exit_px - tp_v) < _tol:
+                                exit_reason = "tp"
+                            elif sl_v > 0 and abs(exit_px - sl_v) < _tol:
+                                exit_reason = "sl"
+                            else:
+                                exit_reason = "timeout"
                             rt_rows.append({
                                 # Unique key per closed trade so Quasar's
                                 # row diffing doesn't churn.
@@ -2870,7 +3222,7 @@ class Dashboard:
                                 "strategy": t.get("strategy_id", "?"),
                                 "broker": t.get("broker_id") or "—",
                                 "pair": t.get("symbol", ""),
-                                "direction": (t.get("side") or "").upper(),
+                                "direction": side,
                                 "entry_time": e_str,
                                 "entry_time_raw": e_ts,
                                 "entry_price": f"{entry_px:{fmt}}",
@@ -2879,6 +3231,8 @@ class Dashboard:
                                 "exit_time": x_str,
                                 "exit_time_raw": x_ts,
                                 "exit_price": f"{exit_px:{fmt}}",
+                                "exit_reason": exit_reason,
+                                "geometry": geometry_str,
                                 "pnl_pct": (f"+{pnl_pct:.3f}%" if pnl_pct >= 0
                                             else f"{pnl_pct:.3f}%"),
                                 "pnl": (f"+{net:.2f}" if net >= 0 else f"{net:.2f}"),
@@ -2895,6 +3249,8 @@ class Dashboard:
                                 "stop_loss": "--", "take_profit": "--",
                                 "exit_time": "--", "exit_time_raw": 0,
                                 "exit_price": "--",
+                                "exit_reason": None,
+                                "geometry": "--",
                                 "pnl_pct": "--", "pnl": "--", "pnl_raw": 0.0,
                             }]
                         recent_trades_table.rows = rt_rows
@@ -3248,6 +3604,17 @@ class Dashboard:
             # (scenario_id, strategy_id, symbol) because a fan-out gives
             # each scenario its own position book.
             chrono = list(reversed(rows))
+
+            # Build approximate tick prices from fill data for P&L conversion.
+            # Iterating oldest→newest means the last value for each symbol
+            # is the most recent fill price — good enough as a conversion proxy.
+            seed_prices: dict[str, dict] = {}
+            for r_s in chrono:
+                s_sym = (r_s[3] or "").upper()
+                s_px = float(r_s[7]) if r_s[7] is not None else 0.0
+                if s_px > 0 and s_sym:
+                    seed_prices[s_sym] = {"bid": s_px, "ask": s_px}
+
             open_positions: dict = {}  # key → list of open fills
             closed_count = 0
             for r in chrono:
@@ -3265,14 +3632,15 @@ class Dashboard:
                         break  # same direction — adds to book, not closes
                     close_qty = min(remaining, head["qty"])
                     if head["side"] == "buy":
-                        pnl = (float(px) - head["px"]) * close_qty
+                        pnl = _to_gbp((float(px) - head["px"]) * close_qty, sym, seed_prices)
                     else:
-                        pnl = (head["px"] - float(px)) * close_qty
+                        pnl = _to_gbp((head["px"] - float(px)) * close_qty, sym, seed_prices)
                     opener_comm = head.get("comm", 0.0)
                     rt_cost = 2.0 * (opener_comm * close_qty / max(head["qty_orig"], 1))
                     net_pnl = pnl - rt_cost
+                    _dsign = +1 if head["side"] == "buy" else -1 if head["side"] == "sell" else 0
                     pnl_pct = (
-                        ((float(px) - head["px"]) / head["px"] * 100.0)
+                        _dsign * (float(px) - head["px"]) / head["px"] * 100.0
                         if head["px"] > 0 else 0.0
                     )
                     trade_key = (scen, strat, sym, head["ts"])
@@ -3346,6 +3714,8 @@ class Dashboard:
             "Seeded %d historical fills + %d closed trades from QuestDB",
             seeded, closed_count,
         )
+        # Queue all seeded closed trades for background MFE/MAE computation.
+        self._mfe_mae_queue.extend(list(self._closed_trades))
 
     def _start_zmq(self):
         self._zmq_running = True
@@ -3369,6 +3739,10 @@ class Dashboard:
             target=self._watchdog_loop, name="zmqgui-watchdog", daemon=True,
         )
         self._watchdog_thread.start()
+        self._mfe_mae_thread = threading.Thread(
+            target=self._mfe_mae_loop, name="zmqgui-mfemae", daemon=True,
+        )
+        self._mfe_mae_thread.start()
 
     def _watchdog_loop(self, interval_s: float = 60.0,
                         stall_threshold: int = 3) -> None:
@@ -3412,6 +3786,79 @@ class Dashboard:
                         "will escalate to ERROR after %d)",
                         interval_s, zero_streak, stall_threshold,
                     )
+
+    def _mfe_mae_loop(self) -> None:
+        """Background thread: drain _mfe_mae_queue, compute MFE/MAE per trade."""
+        import time as _time
+        while self._zmq_running:
+            with self._lock:
+                batch = self._mfe_mae_queue[:]
+                self._mfe_mae_queue.clear()
+            if not batch:
+                _time.sleep(1.0)
+                continue
+            try:
+                import psycopg2
+                conn = psycopg2.connect(
+                    host="localhost", port=8812,
+                    user="admin", password="quest", dbname="qdb",
+                )
+            except Exception as e:
+                logger.debug("MFE/MAE: QuestDB connect failed: %s", e)
+                _time.sleep(5.0)
+                continue
+            try:
+                for trade in batch:
+                    sid = trade.get("strategy_id", "")
+                    sym = trade.get("symbol", "")
+                    side = trade.get("side", "buy")
+                    entry_px = float(trade.get("entry_price") or 0)
+                    entry_ts = float(trade.get("entry_ts") or 0)
+                    exit_ts = float(trade.get("exit_ts") or 0)
+                    cache_key = (sid, sym, entry_ts)
+                    if entry_px <= 0 or entry_ts <= 0 or exit_ts <= 0:
+                        with self._lock:
+                            self._mfe_mae_cache[cache_key] = None
+                        continue
+                    tbl = f"ticks_{sym.lower()}"
+                    entry_us = int(entry_ts * 1_000_000)
+                    exit_us = int(exit_ts * 1_000_000)
+                    sql = (
+                        f"SELECT min((bid+ask)/2.0), max((bid+ask)/2.0) "
+                        f"FROM {tbl} "
+                        f"WHERE timestamp >= cast({entry_us} as timestamp) "
+                        f"  AND timestamp <= cast({exit_us} as timestamp)"
+                    )
+                    try:
+                        with conn.cursor() as cur:
+                            cur.execute(sql)
+                            row = cur.fetchone()
+                        if row and row[0] is not None and row[1] is not None:
+                            min_mid = float(row[0])
+                            max_mid = float(row[1])
+                            if side == "buy":
+                                mfe = (max_mid - entry_px) / entry_px * 10_000
+                                mae = (min_mid - entry_px) / entry_px * 10_000
+                            else:
+                                mfe = (entry_px - min_mid) / entry_px * 10_000
+                                mae = (entry_px - max_mid) / entry_px * 10_000
+                            with self._lock:
+                                self._mfe_mae_cache[cache_key] = {
+                                    "mfe_bps": round(mfe, 1),
+                                    "mae_bps": round(mae, 1),
+                                }
+                        else:
+                            with self._lock:
+                                self._mfe_mae_cache[cache_key] = None
+                    except Exception:
+                        with self._lock:
+                            self._mfe_mae_cache[cache_key] = None
+                    _time.sleep(0.05)  # gentle pacing between per-trade queries
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _zmq_loop(self):
         """Subscribe to every configured PUB endpoint and route messages.
@@ -3617,6 +4064,7 @@ class Dashboard:
             if verdict == "OK":
                 self._econ_cal_ok_ts = time.time()
                 self._econ_cal_ok_msg = msg
+                _save_econ_cal_state(self._econ_cal_ok_ts, msg)
                 logger.info("Calendar health OK heartbeat received (fetch age: %ss)",
                             msg.get("last_successful_fetch_age_sec"))
             else:
@@ -3697,9 +4145,9 @@ class Dashboard:
                 entry_px = existing.get("entry_price", 0)
                 close_qty = min(quantity, existing.get("quantity", 0))
                 if existing["side"] == "buy":
-                    pnl = (price - entry_px) * close_qty
+                    pnl = _to_gbp((price - entry_px) * close_qty, symbol, self._tick_prices)
                 else:
-                    pnl = (entry_px - price) * close_qty
+                    pnl = _to_gbp((entry_px - price) * close_qty, symbol, self._tick_prices)
                 info["pnl"] += pnl
                 scen_info["pnl"] += pnl
                 scen_strat["pnl"] += pnl
@@ -3716,14 +4164,15 @@ class Dashboard:
                 opener_comm = float(existing.get("opener_commission", 0) or 0)
                 rt_cost = 2.0 * opener_comm
                 net_pnl = pnl - rt_cost
+                _dsign = +1 if existing["side"] == "buy" else -1 if existing["side"] == "sell" else 0
                 pnl_pct = (
-                    ((price - entry_px) / entry_px * 100.0)
+                    _dsign * (price - entry_px) / entry_px * 100.0
                     if entry_px > 0 else 0.0
                 )
                 dedup_key = (scen_id, sid, symbol, entry_ts)
                 if dedup_key not in self._closed_trade_keys:
                     self._closed_trade_keys.add(dedup_key)
-                    self._closed_trades.appendleft({
+                    _ct = {
                         "scenario_id": scen_id,
                         "strategy_id": sid,
                         "symbol": symbol,
@@ -3745,7 +4194,9 @@ class Dashboard:
                         "pnl_gross": pnl,
                         "pnl_net": net_pnl,
                         "pnl_pct": pnl_pct,
-                    })
+                    }
+                    self._closed_trades.appendleft(_ct)
+                    self._mfe_mae_queue.append(_ct)
                     # Keep the dedup set bounded by forgetting the
                     # oldest keys as the deque evicts them.
                     if len(self._closed_trade_keys) > MAX_TRADE_LOG * 2:
@@ -3936,6 +4387,13 @@ class Dashboard:
                 info["_spec_conditions"] = msg["spec_conditions"] or []
             if "spec_filters" in msg:
                 info["_spec_filters"] = msg["spec_filters"] or []
+            # Live indicator values published on filter-block ticks (orchestrator
+            # computes indicators even when entry eval is skipped). Used to show
+            # observed values on grey/amber pending chips when entry didn't run.
+            if "current_indicators" in msg:
+                info["_current_indicators"] = msg["current_indicators"] or {}
+            if "current_indicators_by_symbol" in msg:
+                info["_current_indicators_by_symbol"] = msg["current_indicators_by_symbol"] or {}
 
             # Scenario membership — orchestrator's authoritative list
             # of {scenario: [strategies]}. Stash globally (not per
