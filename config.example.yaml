@@ -27,9 +27,13 @@ feed_source: tcp://127.0.0.1:5550
 # Hide tabs you don't need. The backend state keeps tracking
 # everything regardless, so you can turn tabs on/off at will.
 tabs:
-  console: true
-  ftmo:    true
-  arb:     true
+  console:      true   # Strategies, open/closed trades, P&L chart, broker cost table
+  ftmo:         true   # MetaTrader 5 EA log reader and FTMO challenge progress tracker
+  arb:          true   # Sports arbitrage scanner (Betfair/Matchbook back/lay + dutch arbs)
+  vault:        true   # KnowledgeVault git repo-hook heartbeats
+  crypto:       true   # Crypto paper-trader: strategies, chain block ticks, fills
+  vuln:         false  # Adverse intelligence search (QuestDB adverse_intel table)
+  quick_screen: false  # Ad-hoc backtest builder over the Quick Screen RPC service
 
 # --- FTMO tab ---
 # The FTMO tab reads EA activity directly from the MT5 log files,
