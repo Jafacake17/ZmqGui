@@ -33,7 +33,7 @@ from typing import Optional
 
 import zmq
 import yaml
-from nicegui import app, ui
+from nicegui import app, run, ui
 from nicegui.elements.timer import Timer as _NgTimer
 from contextlib import nullcontext as _nullcontext
 from pathlib import Path
@@ -91,9 +91,6 @@ MAX_PNL_POINTS = 500
 # these OUT of the trader-tab cumulative P&L so the chart reflects
 # plugin trading only. Extend when adding non-trader sidecars.
 _SIDECAR_SIDS = {"arbitrage", "arbitrage_live"}
-
-# Instruments with IBKR coverage (3-cap on free tier depth subscriptions)
-_IBKR_INSTRUMENTS = {"EUR_USD", "GBP_USD", "USD_JPY"}
 
 
 # ---------------------------------------------------------------------- #
@@ -787,10 +784,6 @@ class Dashboard:
         # what an RT costs on each (broker, instrument). ZmqGui doesn't
         # parse yamls anymore.
 
-        # IBKR live quotes from tcp://127.0.0.1:5566 — {symbol: {bid, ask, spread}}
-        # Only EUR_USD, GBP_USD, USD_JPY have coverage (3-cap on free-tier depth)
-        self._ibkr_quotes: dict[str, dict] = {}
-
         # Crypto paper-trader state — per-strategy tracking
         # {spec_id: {ts, chains, halted, last_heartbeat, fill_count}}
         self._crypto_strategies: dict[str, dict] = {}
@@ -806,11 +799,14 @@ class Dashboard:
         # Background thread drains it via psycopg2 queries on QuestDB.
         self._mfe_mae_queue: list = []
 
+        # Margin + aggregate bps — updated from heartbeat
+        self._margin_summary: dict = {}   # latest margin_summary from orch
+        self._agg_bps: dict = {}          # total_bps/mean_bps/median_bps from compute_stats
+
         # ZMQ thread control
         self._zmq_running = False
         self._zmq_thread = None
         self._feed_thread = None
-        self._ibkr_feed_thread = None
         # Watchdog counter — incremented at the top of every zmq_loop
         # iteration, including empty polls. The watchdog thread samples
         # this every 60s to detect the 2026-04-21-style wedge where the
@@ -936,6 +932,10 @@ class Dashboard:
                     ui.tab("Vuln").style(f"color: {TEXT_PRIMARY};")
                     if cfg.tabs.get("vuln", True) else None
                 )
+                qs_tab = (
+                    ui.tab("Quick Screen").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("quick_screen", True) else None
+                )
 
             # Restore the last-selected tab across page reloads via per-browser
             # user storage. Falls back to the first enabled tab if the saved
@@ -948,6 +948,7 @@ class Dashboard:
                     ("Vault", vault_tab),
                     ("Crypto", crypto_tab),
                     ("Vuln", vuln_tab),
+                    ("Quick Screen", qs_tab),
                 ) if t is not None
             ]
             saved_tab = app.storage.user.get("active_tab")
@@ -1041,9 +1042,7 @@ class Dashboard:
                     # context, not a decision-driving value.
                     broker_cost_table.add_slot("body-cell-canonical", r"""
                         <q-td :props="props" :style="{
-                            color: '""" + TEXT_SECONDARY + r"""',
-                            fontFamily: 'monospace',
-                            fontSize: '12px'
+                            color: '""" + TEXT_SECONDARY + r"""'
                         }">{{ props.row.canonical }}</q-td>
                     """)
                     # Broker cells: cheapest-per-row green-tinted bold; tooltip
@@ -1080,6 +1079,14 @@ class Dashboard:
                         </q-td>
                     """)
 
+                    # ---- Account Margin tile ----
+                    # Populated from heartbeat margin_summary.accounts[].
+                    # Values are currency-agnostic (whatever the account
+                    # native unit is — USD by default config).
+                    with ui.row().classes("w-full gap-4 mt-2 mb-1 flex-wrap") as _margin_row:
+                        pass
+                    margin_tile = _margin_row
+
                     # ---- Scenario filter (pills above the strategy table) ----
                     # Operator picks a scenario and the table filters to
                     # strategies routed to it. "All" is the default +
@@ -1109,6 +1116,9 @@ class Dashboard:
                         {"name": "warming", "label": "Warming", "field": "warming", "align": "center"},
                         {"name": "scenarios", "label": "Scenarios", "field": "scenarios", "align": "left"},
                         {"name": "spread", "label": "Spread (bps)", "field": "spread", "align": "right"},
+                        # Required margin if a signal fires (from heartbeat).
+                        # Values are currency-agnostic (native account unit).
+                        {"name": "margin", "label": "Margin", "field": "margin", "align": "right"},
                         {"name": "last_signal", "label": "Last Signal", "field": "last_signal", "align": "left"},
                         # Conditions column: renders every entry condition
                         # + filter state as coloured chips.
@@ -1240,6 +1250,9 @@ class Dashboard:
                         {"name": "move_pct", "label": "Move %", "field": "move_pct", "align": "right", "sortable": True, "sort": "numeric"},
                         {"name": "stop_loss", "label": "SL", "field": "stop_loss", "align": "right", "sortable": True},
                         {"name": "take_profit", "label": "TP", "field": "take_profit", "align": "right", "sortable": True},
+                        # Unrealised bps — from heartbeat position snapshot.
+                        # Primary view of open trade performance (bps).
+                        {"name": "unrealised_bps", "label": "bps", "field": "unrealised_bps", "align": "right", "sortable": True, "sort": "numeric"},
                         # Live unrealised P&L — price delta × qty − RT cost
                         # estimate (2× opener commission). Colour-coded
                         # green/red; updates on every tick via the UI timer.
@@ -1305,6 +1318,16 @@ class Dashboard:
                                 color: props.row.pnl_positive ? '""" + GREEN + r"""'
                                      : '""" + RED + r"""',
                             }">{{ props.row.move_pct }}</span>
+                        </q-td>
+                    """)
+                    open_trades_table.add_slot("body-cell-unrealised_bps", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.bps_raw > 0 ? '""" + GREEN + r"""'
+                                     : props.row.bps_raw < 0 ? '""" + RED + r"""'
+                                     : '""" + TEXT_SECONDARY + r"""',
+                                fontWeight: 'bold'
+                            }">{{ props.row.unrealised_bps }}</span>
                         </q-td>
                     """)
                     # Chart cell: anchor to TradingView's chart with the
@@ -1374,6 +1397,8 @@ class Dashboard:
                         {"name": "exit_time", "label": "Exit Time", "field": "exit_time", "align": "left", "sortable": True, "sort": "numeric"},
                         {"name": "exit_price", "label": "Exit", "field": "exit_price", "align": "right", "sortable": True},
                         {"name": "geometry", "label": "MFE:TP:Act:SL:MAE (bps)", "field": "geometry", "align": "right", "sortable": False},
+                        # Net bps per trade — equal-weighted, currency-agnostic primary view.
+                        {"name": "net_bps", "label": "bps", "field": "net_bps", "align": "right", "sortable": True, "sort": "numeric"},
                         {"name": "pnl_pct", "label": "P&L %", "field": "pnl_pct", "align": "right", "sortable": True, "sort": "numeric"},
                         {"name": "pnl", "label": "P&L", "field": "pnl", "align": "right", "sortable": True, "sort": "numeric"},
                     ]
@@ -1386,6 +1411,16 @@ class Dashboard:
                                 color: props.row.direction === 'BUY' ? '""" + GREEN + r"""' : '""" + RED + r"""',
                                 fontWeight: 'bold'
                             }">{{ props.row.direction }}</span>
+                        </q-td>
+                    """)
+                    recent_trades_table.add_slot("body-cell-net_bps", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.pnl_raw > 0 ? '""" + GREEN + r"""'
+                                     : props.row.pnl_raw < 0 ? '""" + RED + r"""'
+                                     : '""" + TEXT_SECONDARY + r"""',
+                                fontWeight: 'bold'
+                            }">{{ props.row.net_bps }}</span>
                         </q-td>
                     """)
                     recent_trades_table.add_slot("body-cell-pnl", r"""
@@ -2762,6 +2797,28 @@ class Dashboard:
                     vuln_btn.on("click", lambda _: run_vuln_search())
                     ui.timer(0, run_vuln_search, once=True)
 
+              # ================ QUICK SCREEN TAB ================
+              if qs_tab is not None:
+                with ui.tab_panel(qs_tab):
+                    from .tabs.quick_screen import fetch_catalogue, build_quick_screen_tab
+                    _qs_container = ui.column().classes("w-full")
+                    _qs_loading = ui.label("Loading Quick Screen catalogue…").style(
+                        f"color: {TEXT_SECONDARY}; font-style: italic;"
+                    )
+
+                    async def _init_qs_tab():
+                        cat = await run.io_bound(fetch_catalogue)
+                        _qs_loading.set_visibility(False)
+                        with _qs_container:
+                            if cat is None:
+                                ui.label(
+                                    "Quick Screen service unavailable at tcp://127.0.0.1:5560"
+                                ).style(f"color: {RED}; font-weight: bold;")
+                            else:
+                                build_quick_screen_tab(cat)
+
+                    ui.timer(0, _init_qs_tab, once=True)
+
             # ---- Periodic UI update — Console tab refresh ----
             # Skipped when Console tab is disabled.
             if console_tab is not None:
@@ -2782,6 +2839,8 @@ class Dashboard:
                         closed_trades = list(dashboard._closed_trades)
                         tick_prices = dict(dashboard._tick_prices)
                         mfe_mae_cache = dict(dashboard._mfe_mae_cache)
+                        margin_summary = dict(dashboard._margin_summary)
+                        agg_bps = dict(dashboard._agg_bps)
                         scenarios = {
                             k: {
                                 "status": v.get("status"),
@@ -2818,6 +2877,53 @@ class Dashboard:
                         self._scenario_filter_toggle.options = scen_opts
                         self._scenario_filter_toggle.update()
 
+                    # (A) Account margin tile — one chip per account
+                    accounts = margin_summary.get("accounts", [])
+                    margin_tile.clear()
+                    if accounts:
+                        with margin_tile:
+                            for acc in accounts:
+                                used = acc.get("used_margin", 0) or 0
+                                free = acc.get("free_margin", 0) or 0
+                                hdroom = acc.get("headroom_trades") or 0
+                                cur = acc.get("account_currency", "")
+                                cur_tag = f" {cur}" if cur else ""
+                                hdroom_color = (GREEN if hdroom >= 5
+                                                else YELLOW if hdroom >= 2
+                                                else RED)
+                                with ui.row().classes("items-center gap-3 px-3 py-1").style(
+                                    f"background-color: {BG_PANEL}; border-radius: 4px;"
+                                    f" border: 1px solid #2a2a3a;"
+                                ):
+                                    ui.label(
+                                        f"used: {used:,.0f}{cur_tag}"
+                                    ).style(f"color: {TEXT_PRIMARY}; font-size: 12px;")
+                                    ui.label(
+                                        f"free: {free:,.0f}{cur_tag}"
+                                    ).style(f"color: {GREEN}; font-size: 12px;")
+                                    ui.label(
+                                        f"headroom: {hdroom} trades"
+                                    ).style(f"color: {hdroom_color}; font-size: 12px; font-weight: bold;")
+
+                    # (E) Aggregate bps — append to header bar when present
+                    if agg_bps:
+                        tot = agg_bps.get("total_bps")
+                        mean = agg_bps.get("mean_bps")
+                        med = agg_bps.get("median_bps")
+                        parts = []
+                        if tot is not None:
+                            parts.append(f"Σ {tot:+.1f}")
+                        if mean is not None:
+                            parts.append(f"μ {mean:+.1f}")
+                        if med is not None:
+                            parts.append(f"med {med:+.1f}")
+                        if parts:
+                            bps_color = GREEN if (mean or 0) >= 0 else RED
+                            pnl_label.set_text(
+                                f"Daily P&L: {pnl_sign}{total_pnl:.2f}  |  bps: {' '.join(parts)}"
+                            )
+                            pnl_label.style(replace=f"color: {pnl_colour};")
+
                     # Resolve which strategies should appear given the
                     # active filter. "All" = no filter.
                     filt = self._scenario_filter
@@ -2838,6 +2944,12 @@ class Dashboard:
                         self._broker_spreads,
                         self._scenario_spread_gates,
                     )
+                    # Annotate rows with required_margin_gbp from strategy info
+                    for row in new_rows:
+                        sid_r = row.get("strategy", "")
+                        sinfo_r = strategies.get(sid_r, {})
+                        rm = sinfo_r.get("required_margin_gbp")
+                        row["margin"] = f"{rm:,.0f}" if rm else "—"
                     strat_table.rows = new_rows
                     strat_table.update()
 
@@ -3095,6 +3207,13 @@ class Dashboard:
                                 timeout_str = f"{mins}m {secs:02d}s"
                         else:
                             timeout_str = "--"
+                        ubps = ot.get("unrealised_bps")
+                        if ubps is not None:
+                            ubps_str = f"{ubps:+.1f}"
+                            ubps_raw = float(ubps)
+                        else:
+                            ubps_str = "--"
+                            ubps_raw = 0.0
                         ot_new_rows.append({
                             "key": f"{sid}_{sym}",
                             "strategy": sid,
@@ -3110,6 +3229,8 @@ class Dashboard:
                             ),
                             "move_pct": move_pct_str,
                             "move_pct_raw": move_pct_raw,
+                            "unrealised_bps": ubps_str,
+                            "bps_raw": ubps_raw,
                             "stop_loss": f"{sl:{fmt}}" if sl else "--",
                             "take_profit": f"{tp:{fmt}}" if tp else "--",
                             "pnl": pnl_str,
@@ -3127,6 +3248,7 @@ class Dashboard:
                             "entry_time": "--", "entry_time_raw": 0, "entry_time_full": "",
                             "entry_price": "--", "current_price": "--",
                             "move_pct": "--", "move_pct_raw": 0.0,
+                            "unrealised_bps": "--", "bps_raw": 0.0,
                             "stop_loss": "--", "take_profit": "--",
                             "pnl": "--", "pnl_raw": 0.0,
                             "timeout": "--", "pnl_positive": True,
@@ -3223,6 +3345,7 @@ class Dashboard:
                                 exit_reason = "sl"
                             else:
                                 exit_reason = "timeout"
+                            raw_bps = float(t.get("net_bps") or 0)
                             rt_rows.append({
                                 # Unique key per closed trade so Quasar's
                                 # row diffing doesn't churn.
@@ -3241,6 +3364,8 @@ class Dashboard:
                                 "exit_price": f"{exit_px:{fmt}}",
                                 "exit_reason": exit_reason,
                                 "geometry": geometry_str,
+                                "net_bps": (f"+{raw_bps:.1f}" if raw_bps >= 0
+                                            else f"{raw_bps:.1f}"),
                                 "pnl_pct": (f"+{pnl_pct:.3f}%" if pnl_pct >= 0
                                             else f"{pnl_pct:.3f}%"),
                                 "pnl": (f"+{net:.2f}" if net >= 0 else f"{net:.2f}"),
@@ -3254,6 +3379,7 @@ class Dashboard:
                                 "direction": "--",
                                 "entry_time": "--", "entry_time_raw": 0,
                                 "entry_price": "--",
+                                "net_bps": "--",
                                 "stop_loss": "--", "take_profit": "--",
                                 "exit_time": "--", "exit_time_raw": 0,
                                 "exit_price": "--",
@@ -3736,11 +3862,6 @@ class Dashboard:
                 target=self._feed_loop, name="zmqgui-feed", daemon=True,
             )
             self._feed_thread.start()
-        # IBKR depth daemon feed for live quotes (tcp://127.0.0.1:5566)
-        self._ibkr_feed_thread = threading.Thread(
-            target=self._ibkr_feed_loop, name="zmqgui-ibkr", daemon=True,
-        )
-        self._ibkr_feed_thread.start()
         # Watchdog — see _watchdog_loop. Started AFTER zmq so the
         # first 60-second sample has real ticks to count.
         self._watchdog_thread = threading.Thread(
@@ -3928,59 +4049,6 @@ class Dashboard:
                         "bid": msg.get("bid", 0),
                         "ask": msg.get("ask", 0),
                     }
-
-        sub.close()
-        bus.close()
-
-    def _ibkr_feed_loop(self):
-        """Separate SUB socket for IBKR depth daemon live quotes (tcp://127.0.0.1:5566).
-
-        Only EUR_USD, GBP_USD, USD_JPY have IBKR coverage (3-cap on free-tier
-        depth subscriptions). Stores {bid, ask, spread} per symbol.
-        """
-        ibkr_port = int(os.environ.get("IBKR_ZMQ_PUB_PORT", "5566"))
-        ibkr_endpoint = f"tcp://127.0.0.1:{ibkr_port}"
-        bus = Bus()
-        try:
-            sub = bus.subscriber(ibkr_endpoint, ["tick."])
-        except Exception as e:
-            logger.warning(f"IBKR feed SUB failed ({ibkr_endpoint}): {e}")
-            bus.close()
-            return
-
-        poller = zmq.Poller()
-        poller.register(sub, zmq.POLLIN)
-
-        logger.info(f"IBKR feed loop started on :{ibkr_port}")
-
-        while self._zmq_running:
-            events = dict(poller.poll(timeout=200))
-            if sub not in events:
-                continue
-            try:
-                msg = Bus.sub_recv(sub)
-            except Exception:
-                continue
-
-            topic = msg.get("topic", "")
-            if topic.startswith("tick."):
-                symbol = topic.split(".", 1)[1]
-                # Only track IBKR-enabled instruments
-                if symbol in _IBKR_INSTRUMENTS:
-                    bid = float(msg.get("bid") or 0)
-                    ask = float(msg.get("ask") or 0)
-                    spread_bps = 0.0
-                    if bid > 0 and ask > bid:
-                        mid = (bid + ask) / 2.0
-                        spread_bps = (ask - bid) / mid * 10_000
-
-                    with self._lock:
-                        self._ibkr_quotes[symbol] = {
-                            "bid": bid,
-                            "ask": ask,
-                            "spread": spread_bps,
-                            "timestamp": msg.get("timestamp", time.time()),
-                        }
 
         sub.close()
         bus.close()
@@ -4202,6 +4270,7 @@ class Dashboard:
                         "pnl_gross": pnl,
                         "pnl_net": net_pnl,
                         "pnl_pct": pnl_pct,
+                        "net_bps": msg.get("net_bps") if msg.get("net_bps") is not None else pnl_pct * 100.0,
                     }
                     self._closed_trades.appendleft(_ct)
                     self._mfe_mae_queue.append(_ct)
@@ -4309,6 +4378,21 @@ class Dashboard:
                     info_scen["broker"] = scen_data.get("broker", info_scen["broker"])
                     info_scen["live"] = bool(scen_data.get("live", info_scen["live"]))
 
+            # Margin summary + aggregate bps from compute_stats
+            margin = msg.get("margin_summary")
+            if margin:
+                self._margin_summary = margin
+            cs = msg.get("compute_stats") or {}
+            for _bk in ("total_bps", "mean_bps", "median_bps"):
+                if _bk in cs:
+                    self._agg_bps[_bk] = cs[_bk]
+                elif _bk in msg:
+                    self._agg_bps[_bk] = msg[_bk]
+
+            # Strategy-level required margin prediction
+            if "required_margin_gbp" in msg:
+                info["required_margin_gbp"] = msg["required_margin_gbp"]
+
             # Authoritative open_positions snapshot (recovers a late-joining GUI)
             positions = msg.get("open_positions")
             if positions is not None:
@@ -4328,6 +4412,8 @@ class Dashboard:
                         "timeout_seconds": pos.get("timeout_seconds", 0),
                         "entry_ts": pos.get("entry_ts", 0),
                         "trade_id": pos.get("trade_id", ""),
+                        "unrealised_bps": pos.get("unrealised_bps"),
+                        "required_margin_gbp": pos.get("required_margin_gbp"),
                     }
 
                 existing_keys = {

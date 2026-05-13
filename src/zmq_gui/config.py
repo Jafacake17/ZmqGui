@@ -49,6 +49,7 @@ class GuiCfg:
     feed_source: str | None = "tcp://127.0.0.1:5550"
     tabs: dict[str, bool] = field(default_factory=lambda: {
         "console": True, "ftmo": True, "arb": True, "vault": True,
+        "crypto": True, "vuln": True, "quick_screen": True,
     })
     ftmo: FtmoCfg = field(default_factory=FtmoCfg)
     arb: ArbCfg = field(default_factory=ArbCfg)
