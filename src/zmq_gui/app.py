@@ -604,7 +604,16 @@ def _build_condition_chips(info: dict) -> list[dict]:
                 color = YELLOW
 
             if passed is None:
-                chips.append({"label": f"{display_name}: warming up", "color": color})
+                if fb and fb.get("filter"):
+                    # filter_block is active but stale entry_traces_by_symbol
+                    # made conds non-empty, bypassing filter_blocked_no_data.
+                    # Entry eval didn't run — show filter state, not "warming up".
+                    f_name = fb.get("filter", "?")
+                    f_detail = fb.get("detail", "")
+                    chip_label = (f"{f_name}: {f_detail}" if f_detail else f_name)
+                    chips.append({"label": chip_label, "color": TEXT_SECONDARY})
+                else:
+                    chips.append({"label": f"{display_name}: warming up", "color": color})
             else:
                 chips.append({
                     "label": f"{display_name}: {obs} {op} {display_thr}",
@@ -625,7 +634,13 @@ def _build_condition_chips(info: dict) -> list[dict]:
             obs = _fmt_trace_num(entry.get("observed"))
             thr = _fmt_trace_num(entry.get("threshold"))
             if passed is None:
-                chips.append({"label": f"{name}: warming up", "color": color})
+                if fb and fb.get("filter"):
+                    f_name = fb.get("filter", "?")
+                    f_detail = fb.get("detail", "")
+                    chip_label = (f"{f_name}: {f_detail}" if f_detail else f_name)
+                    chips.append({"label": chip_label, "color": TEXT_SECONDARY})
+                else:
+                    chips.append({"label": f"{name}: warming up", "color": color})
             else:
                 chips.append({
                     "label": f"{name}: {obs} {op} {thr}",
