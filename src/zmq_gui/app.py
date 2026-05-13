@@ -131,78 +131,44 @@ def _save_econ_cal_state(ok_ts: float, ok_msg: dict) -> None:
 # Broker cost profile loading
 # ---------------------------------------------------------------------- #
 
-def _load_broker_profiles() -> dict[str, dict]:
+# PR-5 cost-model unification (2026-05-13): _load_broker_profiles and
+# _calc_commission_bps were retired. The Broker Effective Costs panel
+# now reads `total_bps` and the per-component breakdown directly off
+# the orchestrator's heartbeat `broker_spreads[<short>][<sym>]` fields
+# (orch-side `_apply_structural_breakdown` populated by PR-4 lands the
+# size-invariant structural RT cost via cost_model.cost_per_roundtrip_
+# structural_bps). ZmqGui no longer parses yamls or recomputes
+# commission — single source of truth lives in
+# console/core/cost_model.py. See git e03d527..PR-5 for the full
+# unification arc.
+
+
+# Active deployed-spec instrument set as of 2026-05-13. Used by the
+# Broker Effective Costs panel for row enumeration. USD_CHF and
+# EUR_JPY intentionally excluded — no promoted spec touches them today.
+# When a spec promotes there, append to this list. Sorted display
+# order matches the table layout.
+_ACTIVE_PAIRS: list[str] = [
+    "AUD_USD", "EUR_GBP", "EUR_USD", "GBP_USD",
+    "NZD_USD", "USD_CAD", "USD_JPY", "XAU_USD",
+]
+
+
+def _fmt_canonical_mid(instrument: str, mid: float) -> str:
+    """Format mid price per pair-class convention.
+
+    - 5dp for FX majors (EUR_USD, GBP_USD, AUD_USD, NZD_USD, USD_CAD, EUR_GBP)
+    - 3dp for *_JPY pairs (USD_JPY, EUR_JPY)
+    - 2dp for metals (XAU_USD, XAG_USD)
+    Returns "—" when no valid mid is available.
     """
-    Load broker cost profiles from YAML files in ModularTradeApp/console/brokers/.
-    Returns: {broker_id: {symbol: {commission_model, commission_rate, extra_commission}}}
-    """
-    profiles = {}
-    brokers_path = Path(os.path.expanduser("~")) / "ModularTradeApp" / "console" / "brokers"
-
-    if not brokers_path.exists():
-        logger.warning(f"Brokers config path not found: {brokers_path}")
-        return profiles
-
-    for yaml_file in brokers_path.glob("*.yaml"):
-        try:
-            with open(yaml_file) as f:
-                cfg = yaml.safe_load(f) or {}
-
-            broker_id = cfg.get("id", yaml_file.stem)
-            cost_profile = cfg.get("cost_profile", {})
-
-            # Extract forex profile as default, then instrument-specific overrides
-            broker_prof = {}
-            forex_prof = cost_profile.get("forex", {})
-            if forex_prof:
-                broker_prof["_default"] = {
-                    "commission_model": forex_prof.get("commission_model", "per_unit"),
-                    "commission_rate": float(forex_prof.get("commission_rate", 0.0)),
-                    "extra_commission_per_trade": float(forex_prof.get("extra_commission_per_trade", 0.0)),
-                }
-
-            # Per-instrument overrides
-            for sym, sym_cfg in cost_profile.get("instruments", {}).items():
-                if isinstance(sym_cfg, dict):
-                    broker_prof[sym] = {
-                        "commission_model": sym_cfg.get("commission_model", forex_prof.get("commission_model", "per_unit")),
-                        "commission_rate": float(sym_cfg.get("commission_rate", 0.0)),
-                        "extra_commission_per_trade": float(sym_cfg.get("extra_commission_per_trade", 0.0)),
-                    }
-
-            profiles[broker_id] = broker_prof
-            logger.info(f"Loaded broker profile: {broker_id}")
-        except Exception as e:
-            logger.warning(f"Failed to load broker profile {yaml_file}: {e}")
-
-    return profiles
-
-
-def _calc_commission_bps(commission_rate: float, extra_comm: float, mid: float, qty: float,
-                         commission_model: str = "per_unit") -> float:
-    """
-    Calculate round-trip commission in basis points.
-    Both models return qty-invariant percentages-of-notional.
-    - per_unit: commission_rate is per unit of base; compute as % of mid
-    - notional_pct: commission_rate is already a % of notional
-    Extra flat per-trade fee scales inversely with size (divide by notional).
-    """
-    if qty <= 0 or mid <= 0:
-        return 0.0
-
-    if commission_model == "notional_pct":
-        # commission_rate is already a % of notional
-        comm_bps = commission_rate * 2 * 10_000
-    else:
-        # per_unit: rate is in quote currency per unit base
-        # qty cancels out in the ratio, result is qty-invariant
-        comm_bps = (commission_rate * 2 / mid) * 10_000
-
-    # Flat per-trade fee (dollars): scales inversely with notional size
-    if extra_comm > 0:
-        comm_bps += (extra_comm * 2 / (mid * qty)) * 10_000
-
-    return comm_bps
+    if mid <= 0:
+        return "—"
+    if instrument.startswith("XAU") or instrument.startswith("XAG"):
+        return f"{mid:,.2f}"
+    if instrument.endswith("_JPY"):
+        return f"{mid:.3f}"
+    return f"{mid:.5f}"
 
 
 def _tick_mid(tick_prices: dict, symbol: str) -> float:
@@ -813,9 +779,13 @@ class Dashboard:
         # Latest tick prices from the feed PUB — symbol → {bid, ask}
         self._tick_prices: dict[str, dict] = {}
 
-        # Broker cost profiles: {broker_id: {symbol: {commission_model, commission_rate, extra_commission}}}
-        # Loaded from ModularTradeApp/console/brokers/*.yaml on startup
-        self._broker_profiles = _load_broker_profiles()
+        # PR-5 cost-model unification (2026-05-13): self._broker_profiles
+        # retired. The Broker Effective Costs panel reads total_bps +
+        # breakdown directly from orch heartbeat's broker_spreads — the
+        # orch-side _apply_structural_breakdown (cost_model.cost_per_
+        # roundtrip_structural_bps) is the single source of truth for
+        # what an RT costs on each (broker, instrument). ZmqGui doesn't
+        # parse yamls anymore.
 
         # IBKR live quotes from tcp://127.0.0.1:5566 — {symbol: {bid, ask, spread}}
         # Only EUR_USD, GBP_USD, USD_JPY have coverage (3-cap on free-tier depth)
@@ -1033,47 +1003,81 @@ class Dashboard:
                     """)
 
                     # ---- Broker Effective Costs panel ----
-                    # Shows spread + commission for OANDA, Dukascopy, IBKR across
-                    # EUR_USD, GBP_USD, USD_JPY (IBKR-enabled instruments).
-                    # Used for "would route here" decision visualization.
-                    ui.label("Broker Effective Costs").classes("mt-4").style(
+                    # PR-5 cost-model unification (2026-05-13): 8-pair × 3-broker
+                    # table. Cell value = `total_bps` from the orch heartbeat's
+                    # broker_spreads structural breakdown (cost_model.cost_per_
+                    # roundtrip_structural_bps = spread + 2×slippage_bps +
+                    # 2×per-unit-commission_bps; size-invariant per D9, NO flat
+                    # fees in the cell). Canonical column = mid price formatted
+                    # per pair-class convention. Tooltip on each broker cell
+                    # surfaces the breakdown (spread / slip / comm / flat).
+                    # Cheapest-per-row highlighted in green.
+                    ui.label("Broker Effective Costs (RT bps)").classes("mt-4").style(
                         f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
                     )
                     broker_cost_columns = [
-                        {"name": "instrument", "label": "Instrument", "field": "instrument", "align": "left"},
-                        {"name": "oanda", "label": "OANDA", "field": "oanda", "align": "center"},
-                        {"name": "dukascopy", "label": "Dukascopy", "field": "dukascopy", "align": "center"},
-                        {"name": "ibkr", "label": "IBKR", "field": "ibkr", "align": "center"},
+                        {"name": "instrument", "label": "Instrument",
+                         "field": "instrument", "align": "left"},
+                        {"name": "canonical", "label": "Mid",
+                         "field": "canonical", "align": "right"},
+                        {"name": "oanda", "label": "OANDA",
+                         "field": "oanda", "align": "center"},
+                        {"name": "dukascopy", "label": "Dukascopy",
+                         "field": "dukascopy", "align": "center"},
+                        {"name": "ibkr", "label": "IBKR",
+                         "field": "ibkr", "align": "center"},
                     ]
                     broker_cost_rows = [
-                        {"instrument": sym, "oanda": "—", "dukascopy": "—", "ibkr": "—"}
-                        for sym in sorted(_IBKR_INSTRUMENTS)
+                        {"instrument": sym, "canonical": "—",
+                         "oanda": "—", "dukascopy": "—", "ibkr": "—"}
+                        for sym in _ACTIVE_PAIRS
                     ]
                     broker_cost_table = ui.table(
-                        columns=broker_cost_columns, rows=broker_cost_rows, row_key="instrument",
+                        columns=broker_cost_columns, rows=broker_cost_rows,
+                        row_key="instrument",
                     ).classes("w-full").style(f"background-color: {BG_PANEL};")
 
-                    # Colour code cells: green = best, yellow = medium, red = worst
+                    # Canonical column rendered in muted text — it's reference
+                    # context, not a decision-driving value.
+                    broker_cost_table.add_slot("body-cell-canonical", r"""
+                        <q-td :props="props" :style="{
+                            color: '""" + TEXT_SECONDARY + r"""',
+                            fontFamily: 'monospace',
+                            fontSize: '12px'
+                        }">{{ props.row.canonical }}</q-td>
+                    """)
+                    # Broker cells: cheapest-per-row green-tinted bold; tooltip
+                    # shows the spread/slip/comm breakdown plus the IBKR flat-
+                    # fee-at-baseline-qty annotation when present.
                     broker_cost_table.add_slot("body-cell-oanda", r"""
                         <q-td :props="props" :style="{
                             backgroundColor: props.row.oanda_best ? '""" + GREEN + r"""22' : 'transparent',
                             color: props.row.oanda_best ? '""" + GREEN + r"""' : '""" + TEXT_PRIMARY + r"""',
                             fontWeight: props.row.oanda_best ? 'bold' : 'normal'
-                        }">{{ props.row.oanda }}</q-td>
+                        }">
+                            {{ props.row.oanda }}
+                            <q-tooltip v-if="props.row.oanda_tip" anchor="top middle" self="bottom middle">{{ props.row.oanda_tip }}</q-tooltip>
+                        </q-td>
                     """)
                     broker_cost_table.add_slot("body-cell-dukascopy", r"""
                         <q-td :props="props" :style="{
                             backgroundColor: props.row.duka_best ? '""" + GREEN + r"""22' : 'transparent',
                             color: props.row.duka_best ? '""" + GREEN + r"""' : '""" + TEXT_PRIMARY + r"""',
                             fontWeight: props.row.duka_best ? 'bold' : 'normal'
-                        }">{{ props.row.dukascopy }}</q-td>
+                        }">
+                            {{ props.row.dukascopy }}
+                            <q-tooltip v-if="props.row.duka_tip" anchor="top middle" self="bottom middle">{{ props.row.duka_tip }}</q-tooltip>
+                        </q-td>
                     """)
                     broker_cost_table.add_slot("body-cell-ibkr", r"""
                         <q-td :props="props" :style="{
                             backgroundColor: props.row.ibkr_best ? '""" + GREEN + r"""22' : (props.row.ibkr === '—' ? 'transparent' : '""" + YELLOW + r"""22'),
                             color: props.row.ibkr_best ? '""" + GREEN + r"""' : (props.row.ibkr === '—' ? '""" + TEXT_SECONDARY + r"""' : '""" + TEXT_PRIMARY + r"""'),
                             fontWeight: props.row.ibkr_best ? 'bold' : 'normal'
-                        }">{{ props.row.ibkr }}</q-td>
+                        }">
+                            {{ props.row.ibkr }}
+                            <q-tooltip v-if="props.row.ibkr_tip" anchor="top middle" self="bottom middle">{{ props.row.ibkr_tip }}</q-tooltip>
+                        </q-td>
                     """)
 
                     # ---- Scenario filter (pills above the strategy table) ----
@@ -2867,99 +2871,103 @@ class Dashboard:
                     scen_table.rows = scen_new_rows
                     scen_table.update()
 
-                    # Broker effective costs panel — show spread + commission per broker
-                    # for IBKR-enabled instruments (EUR_USD, GBP_USD, USD_JPY).
-                    # Used for "would route here" visualization.
+                    # Broker effective costs panel — total_bps + breakdown
+                    # read directly from orch heartbeat's broker_spreads.
+                    # PR-5 cost-model unification (2026-05-13): ZmqGui no
+                    # longer recomputes anything — orch-side
+                    # _apply_structural_breakdown (cost_model.cost_per_
+                    # roundtrip_structural_bps) is the single source of
+                    # truth. Cell value is the structural total in
+                    # USD-notional bps (size-invariant, NO flat fees per
+                    # D9); flat-fee impact at baseline qty=1000 shows up
+                    # in the tooltip as a reference annotation.
                     with dashboard._lock:
                         broker_spreads = dict(dashboard._broker_spreads)
-                        ibkr_quotes = dict(dashboard._ibkr_quotes)
-                    broker_profiles = dashboard._broker_profiles
 
-                    # Map broker IDs to data_source keys (heartbeat uses short keys)
+                    # broker_id → short bucket key in broker_spreads
                     broker_data_source_map = {
                         "oanda-practice": "oanda",
                         "dukascopy-demo": "dukascopy",
                         "ibkr-pro": "ibkr",
                     }
 
-                    # Build rows: one per IBKR instrument with effective costs
                     broker_cost_new_rows = []
-                    for instrument in sorted(_IBKR_INSTRUMENTS):
-                        costs_per_broker = {}  # {broker_id: effective_bps or None}
+                    for instrument in _ACTIVE_PAIRS:
+                        # Per-broker total_bps + breakdown components.
+                        costs_per_broker: dict[str, float | None] = {}
+                        breakdown_per_broker: dict[str, dict] = {}
+                        # Use the first valid bid/ask we see for the
+                        # canonical mid column (mid is broker-neutral; any
+                        # of the three feeds is fine).
+                        mid_for_canonical = 0.0
 
-                        for broker_id in ["oanda-practice", "dukascopy-demo", "ibkr-pro"]:
-                            spread_bps = None
-                            comm_bps = 0.0
-                            mid = 0.0
-
-                            # Get current spread using mapped data_source key
-                            data_source_key = broker_data_source_map.get(broker_id)
-                            spread_info = broker_spreads.get(data_source_key, {}).get(instrument, {})
-                            if spread_info:
-                                spread_bps = float(spread_info.get("spread_bps", 0))
-                                if spread_bps < 0:
-                                    spread_bps = None  # Invalid spread
-                            elif broker_id == "ibkr-pro" and instrument in ibkr_quotes:
-                                # Use IBKR live quote if available
-                                q = ibkr_quotes[instrument]
-                                ts = q.get("timestamp", 0)
-                                age = time.time() - ts
-                                # Stale if >30s old
-                                if age <= 30.0:
-                                    spread_bps = q.get("spread", 0)
-                                    if spread_bps < 0:
-                                        spread_bps = None
-
-                            # Get mid price for commission calculation (qty=1000 standard)
-                            if broker_id == "ibkr-pro" and instrument in ibkr_quotes:
-                                q = ibkr_quotes[instrument]
-                                bid = q.get("bid", 0)
-                                ask = q.get("ask", 0)
-                                if bid > 0 and ask > bid:
-                                    mid = (bid + ask) / 2.0
-                            elif spread_info and "bid" in spread_info and "ask" in spread_info:
-                                bid = float(spread_info.get("bid", 0))
-                                ask = float(spread_info.get("ask", 0))
-                                if bid > 0 and ask > bid:
-                                    mid = (bid + ask) / 2.0
-
-                            # Calculate commission (only if mid is valid and spread exists)
-                            if mid > 0 and spread_bps is not None:
-                                prof = broker_profiles.get(broker_id, {})
-                                # Check per-instrument override first, else default
-                                sym_prof = prof.get(instrument)
-                                if not sym_prof:
-                                    sym_prof = prof.get("_default", {})
-
-                                if sym_prof:
-                                    commission_rate = float(sym_prof.get("commission_rate", 0))
-                                    extra_comm = float(sym_prof.get("extra_commission_per_trade", 0))
-                                    commission_model = sym_prof.get("commission_model", "per_unit")
-                                    # Use standard qty=1000 for comparison
-                                    comm_bps = _calc_commission_bps(
-                                        commission_rate, extra_comm, mid, 1000,
-                                        commission_model
-                                    )
-
-                            # Effective cost = spread + commission (only if both valid)
-                            if spread_bps is not None and spread_bps >= 0 and mid > 0:
-                                effective_bps = spread_bps + comm_bps
-                                costs_per_broker[broker_id] = effective_bps
-                            else:
+                        for broker_id, ds_key in broker_data_source_map.items():
+                            cell = broker_spreads.get(ds_key, {}).get(instrument)
+                            if not cell:
                                 costs_per_broker[broker_id] = None
+                                breakdown_per_broker[broker_id] = {}
+                                continue
+                            total = cell.get("total_bps")
+                            if total is None:
+                                # Pre-PR-4 orch (no structural breakdown).
+                                # Fall back to raw spread_bps so the cell
+                                # still shows something rather than "—".
+                                total = cell.get("spread_bps")
+                            costs_per_broker[broker_id] = (
+                                float(total) if total is not None else None)
+                            breakdown_per_broker[broker_id] = {
+                                "spread": cell.get("spread_bps"),
+                                "slip":   cell.get("slippage_bps_rt"),
+                                "comm":   cell.get("commission_bps_rt"),
+                                "flat":   cell.get("flat_bps_baseline_qty"),
+                                "source": cell.get("source"),
+                            }
+                            if mid_for_canonical <= 0:
+                                bid = float(cell.get("bid") or 0)
+                                ask = float(cell.get("ask") or 0)
+                                if bid > 0 and ask > bid:
+                                    mid_for_canonical = (bid + ask) / 2
 
-                        # Format display strings and find best
-                        valid_costs = {k: v for k, v in costs_per_broker.items() if v is not None and v >= 0}
-                        best_broker = min(valid_costs.items(), key=lambda x: x[1], default=(None, float("inf")))[0] if valid_costs else None
+                        canonical_str = _fmt_canonical_mid(
+                            instrument, mid_for_canonical)
+
+                        valid_costs = {k: v for k, v in costs_per_broker.items()
+                                       if v is not None and v >= 0}
+                        best_broker = (min(valid_costs.items(), key=lambda x: x[1])[0]
+                                       if valid_costs else None)
+
+                        def _tip(b: str) -> str:
+                            d = breakdown_per_broker.get(b) or {}
+                            parts = []
+                            for label, key in (("spread", "spread"),
+                                                ("slip", "slip"),
+                                                ("comm", "comm")):
+                                v = d.get(key)
+                                if v is not None:
+                                    parts.append(f"{label}={float(v):.3f}")
+                            flat = d.get("flat")
+                            if flat is not None and float(flat) > 0:
+                                parts.append(f"+flat@qty=1k: {float(flat):.1f} bps")
+                            src = d.get("source")
+                            if src:
+                                parts.append(f"({src})")
+                            return "  ".join(parts) if parts else ""
 
                         row = {
                             "instrument": instrument,
-                            "oanda": f"{costs_per_broker.get('oanda-practice'):.2f}" if costs_per_broker.get('oanda-practice') is not None else "—",
-                            "dukascopy": f"{costs_per_broker.get('dukascopy-demo'):.2f}" if costs_per_broker.get('dukascopy-demo') is not None else "—",
-                            "ibkr": f"{costs_per_broker.get('ibkr-pro'):.2f}" if costs_per_broker.get('ibkr-pro') is not None else "—",
+                            "canonical": canonical_str,
+                            "oanda": (f"{costs_per_broker['oanda-practice']:.2f}"
+                                      if costs_per_broker.get('oanda-practice') is not None else "—"),
+                            "dukascopy": (f"{costs_per_broker['dukascopy-demo']:.2f}"
+                                           if costs_per_broker.get('dukascopy-demo') is not None else "—"),
+                            "ibkr": (f"{costs_per_broker['ibkr-pro']:.2f}"
+                                     if costs_per_broker.get('ibkr-pro') is not None else "—"),
                             "oanda_best": best_broker == "oanda-practice",
-                            "duka_best": best_broker == "dukascopy-demo",
-                            "ibkr_best": best_broker == "ibkr-pro",
+                            "duka_best":  best_broker == "dukascopy-demo",
+                            "ibkr_best":  best_broker == "ibkr-pro",
+                            "oanda_tip": _tip("oanda-practice"),
+                            "duka_tip":  _tip("dukascopy-demo"),
+                            "ibkr_tip":  _tip("ibkr-pro"),
                         }
                         broker_cost_new_rows.append(row)
 
