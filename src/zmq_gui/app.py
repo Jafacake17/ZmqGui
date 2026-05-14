@@ -654,7 +654,7 @@ def _build_condition_chips(info: dict) -> list[dict]:
         broker_display = (
             "OANDA" if "oanda" in last_broker.lower() else
             "Duka" if "dukascopy" in last_broker.lower() else
-            "IBKR" if "ibkr" in last_broker.lower() else
+            "IG" if "ig-cfd-demo" in last_broker.lower() else
             last_broker[:6]
         )
         chips.append({
@@ -1040,12 +1040,12 @@ class Dashboard:
                          "field": "oanda", "align": "center"},
                         {"name": "dukascopy", "label": "Dukascopy",
                          "field": "dukascopy", "align": "center"},
-                        {"name": "ibkr", "label": "IBKR",
-                         "field": "ibkr", "align": "center"},
+                        {"name": "ig", "label": "IG",
+                         "field": "ig", "align": "center"},
                     ]
                     broker_cost_rows = [
                         {"instrument": sym, "canonical": "—",
-                         "oanda": "—", "dukascopy": "—", "ibkr": "—"}
+                         "oanda": "—", "dukascopy": "—", "ig": "—"}
                         for sym in _ACTIVE_PAIRS
                     ]
                     broker_cost_table = ui.table(
@@ -1061,8 +1061,7 @@ class Dashboard:
                         }">{{ props.row.canonical }}</q-td>
                     """)
                     # Broker cells: cheapest-per-row green-tinted bold; tooltip
-                    # shows the spread/slip/comm breakdown plus the IBKR flat-
-                    # fee-at-baseline-qty annotation when present.
+                    # shows the spread/slip/comm breakdown.
                     broker_cost_table.add_slot("body-cell-oanda", r"""
                         <q-td :props="props" :style="{
                             backgroundColor: props.row.oanda_best ? '""" + GREEN + r"""22' : 'transparent',
@@ -1083,14 +1082,14 @@ class Dashboard:
                             <q-tooltip v-if="props.row.duka_tip" anchor="top middle" self="bottom middle">{{ props.row.duka_tip }}</q-tooltip>
                         </q-td>
                     """)
-                    broker_cost_table.add_slot("body-cell-ibkr", r"""
+                    broker_cost_table.add_slot("body-cell-ig", r"""
                         <q-td :props="props" :style="{
-                            backgroundColor: props.row.ibkr_best ? '""" + GREEN + r"""22' : (props.row.ibkr === '—' ? 'transparent' : '""" + YELLOW + r"""22'),
-                            color: props.row.ibkr_best ? '""" + GREEN + r"""' : (props.row.ibkr === '—' ? '""" + TEXT_SECONDARY + r"""' : '""" + TEXT_PRIMARY + r"""'),
-                            fontWeight: props.row.ibkr_best ? 'bold' : 'normal'
+                            backgroundColor: props.row.ig_best ? '""" + GREEN + r"""22' : 'transparent',
+                            color: props.row.ig_best ? '""" + GREEN + r"""' : '""" + TEXT_PRIMARY + r"""',
+                            fontWeight: props.row.ig_best ? 'bold' : 'normal'
                         }">
-                            {{ props.row.ibkr }}
-                            <q-tooltip v-if="props.row.ibkr_tip" anchor="top middle" self="bottom middle">{{ props.row.ibkr_tip }}</q-tooltip>
+                            {{ props.row.ig }}
+                            <q-tooltip v-if="props.row.ig_tip" anchor="top middle" self="bottom middle">{{ props.row.ig_tip }}</q-tooltip>
                         </q-td>
                     """)
 
@@ -3015,7 +3014,7 @@ class Dashboard:
                     broker_data_source_map = {
                         "oanda-practice": "oanda",
                         "dukascopy-demo": "dukascopy",
-                        "ibkr-pro": "ibkr",
+                        "ig-cfd-demo": "ig",
                     }
 
                     broker_cost_new_rows = []
@@ -3087,14 +3086,14 @@ class Dashboard:
                                       if costs_per_broker.get('oanda-practice') is not None else "—"),
                             "dukascopy": (f"{costs_per_broker['dukascopy-demo']:.2f}"
                                            if costs_per_broker.get('dukascopy-demo') is not None else "—"),
-                            "ibkr": (f"{costs_per_broker['ibkr-pro']:.2f}"
-                                     if costs_per_broker.get('ibkr-pro') is not None else "—"),
+                            "ig": (f"{costs_per_broker['ig-cfd-demo']:.2f}"
+                                   if costs_per_broker.get('ig-cfd-demo') is not None else "—"),
                             "oanda_best": best_broker == "oanda-practice",
                             "duka_best":  best_broker == "dukascopy-demo",
-                            "ibkr_best":  best_broker == "ibkr-pro",
+                            "ig_best":    best_broker == "ig-cfd-demo",
                             "oanda_tip": _tip("oanda-practice"),
                             "duka_tip":  _tip("dukascopy-demo"),
-                            "ibkr_tip":  _tip("ibkr-pro"),
+                            "ig_tip":    _tip("ig-cfd-demo"),
                         }
                         broker_cost_new_rows.append(row)
 
