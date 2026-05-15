@@ -992,7 +992,7 @@ class Dashboard:
                         {"name": "broker", "label": "Broker", "field": "broker", "align": "left"},
                         {"name": "live", "label": "Live", "field": "live", "align": "center"},
                         {"name": "status", "label": "Status", "field": "status", "align": "center"},
-                        {"name": "pnl", "label": "P&L Today", "field": "pnl", "align": "right"},
+                        {"name": "pnl", "label": "P&L Today (bps)", "field": "pnl", "align": "right"},
                         {"name": "trades", "label": "Trades", "field": "trades", "align": "center"},
                         {"name": "win_pct", "label": "Win %", "field": "win_pct", "align": "center"},
                         {"name": "n_strategies", "label": "Strategies", "field": "n_strategies", "align": "center"},
@@ -1368,7 +1368,7 @@ class Dashboard:
                             "x": [], "y": [],
                             "type": "scatter", "mode": "lines",
                             "line": {"color": PNL_LINE_COLOUR, "width": 2},
-                            "name": "Cumulative P&L",
+                            "name": "Cumulative P&L (bps)",
                         }],
                         "layout": {
                             "paper_bgcolor": BG_DARK,
@@ -1376,8 +1376,8 @@ class Dashboard:
                             "font": {"color": TEXT_PRIMARY},
                             "margin": {"l": 50, "r": 20, "t": 30, "b": 30},
                             "xaxis": {"showticklabels": False, "gridcolor": "#32324a"},
-                            "yaxis": {"title": "P&L", "gridcolor": "#32324a"},
-                            "title": {"text": "Cumulative P&L (trader activity only)", "font": {"size": 14}},
+                            "yaxis": {"title": "bps", "gridcolor": "#32324a"},
+                            "title": {"text": "Cumulative P&L (bps, trader activity only)", "font": {"size": 14}},
                             "showlegend": False,
                         },
                     }
@@ -2873,7 +2873,7 @@ class Dashboard:
                     pnl_sign = "+" if total_pnl >= 0 else ""
                     pnl_colour = GREEN if total_pnl >= 0 else RED
                     mode_label.set_text(f"Mode: {mode.upper()}")
-                    pnl_label.set_text(f"Daily P&L: {pnl_sign}{total_pnl:.2f}")
+                    pnl_label.set_text(f"Daily P&L: {pnl_sign}{total_pnl:.1f} bps")
                     pnl_label.style(replace=f"color: {pnl_colour};")
                     strat_label.set_text(f"Strategies: {len(strategies)}")
                     clock_label.set_text(now)
@@ -2934,7 +2934,7 @@ class Dashboard:
                         if parts:
                             bps_color = GREEN if (mean or 0) >= 0 else RED
                             pnl_label.set_text(
-                                f"Daily P&L: {pnl_sign}{total_pnl:.2f}  |  bps: {' '.join(parts)}"
+                                f"Daily P&L: {pnl_sign}{total_pnl:.1f} bps  |  tick: {' '.join(parts)}"
                             )
                             pnl_label.style(replace=f"color: {pnl_colour};")
 
@@ -2975,8 +2975,15 @@ class Dashboard:
                     )
                     if show_scenarios:
                         for scen_id, sinfo in sorted(scenarios.items()):
-                            spnl = sinfo.get("pnl", 0.0)
-                            spnl_s = f"+{spnl:.2f}" if spnl >= 0 else f"{spnl:.2f}"
+                            # Sum pnl_bps from all strategies routed to this
+                            # scenario. Uses the same strat_to_scenarios map
+                            # that drives the strategy table filter.
+                            scen_strat_ids = self._scenario_strategies.get(scen_id, [])
+                            spnl = sum(
+                                strategies.get(s, {}).get("pnl_bps", 0.0)
+                                for s in scen_strat_ids
+                            )
+                            spnl_s = f"+{spnl:.1f}" if spnl >= 0 else f"{spnl:.1f}"
                             s_trades = sinfo.get("trades", 0)
                             s_wins = sinfo.get("wins", 0)
                             s_winpct = (
@@ -4296,17 +4303,6 @@ class Dashboard:
                              t.get("symbol"), t.get("entry_ts"))
                             for t in self._closed_trades
                         )
-                # Trader-tab P&L total: sum across plugin strategies
-                # ONLY — sidecars like the sports arbitrage scanner
-                # publish fills too but belong on their own tab, and
-                # mixing them into the cumulative P&L chart conflates
-                # two separate books. `_SIDECAR_SIDS` is the excluded
-                # set; extend when adding new non-trader sidecars.
-                self._total_pnl = sum(
-                    s.get("pnl", 0)
-                    for sid, s in self._strategies.items()
-                    if sid not in _SIDECAR_SIDS
-                )
                 del self._open_trades[key]
             elif not existing:
                 self._open_trades[key] = {
@@ -4338,16 +4334,14 @@ class Dashboard:
             info["last_heartbeat"] = time.time()
             info["_metric_age"] = 0
 
-            if name == "pnl":
-                info["pnl"] = float(value)
-                # Trader-tab P&L total: sum across plugin strategies
-                # ONLY — sidecars like the sports arbitrage scanner
-                # publish fills too but belong on their own tab, and
-                # mixing them into the cumulative P&L chart conflates
-                # two separate books. `_SIDECAR_SIDS` is the excluded
-                # set; extend when adding new non-trader sidecars.
+            if name == "pnl_bps":
+                info["pnl_bps"] = float(value)
+                # Trader-tab bps total: equal-weighted sum across plugin
+                # strategies. Currency-agnostic — XAU and EUR_USD trades
+                # contribute equally at the same bps magnitude.
+                # Sidecars (arb scanner) excluded — they have their own tab.
                 self._total_pnl = sum(
-                    s.get("pnl", 0)
+                    s.get("pnl_bps", 0.0)
                     for sid, s in self._strategies.items()
                     if sid not in _SIDECAR_SIDS
                 )
