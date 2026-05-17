@@ -40,6 +40,11 @@ class ArbCfg:
 
 
 @dataclass
+class StaCfg:
+    endpoint: str = "tcp://127.0.0.1:5570"
+
+
+@dataclass
 class GuiCfg:
     web_port: int = 8080
     sources: list[str] = field(default_factory=lambda: [
@@ -50,9 +55,12 @@ class GuiCfg:
     tabs: dict[str, bool] = field(default_factory=lambda: {
         "console": True, "ftmo": True, "arb": True, "vault": True,
         "crypto": True, "vuln": True, "quick_screen": True,
+        "sta_trades": True, "sta_slates": True, "sta_chain": True,
+        "sta_lifecycle": True, "sta_health": True,
     })
     ftmo: FtmoCfg = field(default_factory=FtmoCfg)
     arb: ArbCfg = field(default_factory=ArbCfg)
+    sta: StaCfg = field(default_factory=StaCfg)
 
 
 def load(path: str | None) -> GuiCfg:
@@ -86,5 +94,8 @@ def load(path: str | None) -> GuiCfg:
     arb_raw = raw.get("arb") or {}
     cfg.arb.enabled = cfg.tabs.get("arb", True)
     cfg.arb.config_path = arb_raw.get("config_path", cfg.arb.config_path)
+
+    sta_raw = raw.get("sta") or {}
+    cfg.sta.endpoint = sta_raw.get("endpoint", cfg.sta.endpoint)
 
     return cfg

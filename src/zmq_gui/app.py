@@ -72,7 +72,7 @@ def _safe_timer_get_context(self):
 
 
 _NgTimer._get_context = _safe_timer_get_context
-from .config import GuiCfg, load as load_config
+from .config import GuiCfg, StaCfg, load as load_config
 from .theme import (
     BG_DARK, BG_PANEL, BG_HEADER,
     GREEN, YELLOW, RED, BLUE, TEXT_SECONDARY, TEXT_PRIMARY,
@@ -818,10 +818,20 @@ class Dashboard:
         self._margin_summary: dict = {}   # latest margin_summary from orch
         self._agg_bps: dict = {}          # total_bps/mean_bps/median_bps from compute_stats
 
+        # STA (StructuredTradeApp) state — updated from tcp://127.0.0.1:5570
+        # _sta_latest: most recent heartbeat payload (full dict)
+        # _sta_last_ts: wall-clock when last heartbeat was received
+        # _sta_lifecycle_history: record_id → ordered list of state-transition
+        #   snapshots for the STA Lifecycle audit tab
+        self._sta_latest: dict | None = None
+        self._sta_last_ts: float = 0.0
+        self._sta_lifecycle_history: dict[str, list[dict]] = {}
+
         # ZMQ thread control
         self._zmq_running = False
         self._zmq_thread = None
         self._feed_thread = None
+        self._sta_feed_thread = None
         # Watchdog counter — incremented at the top of every zmq_loop
         # iteration, including empty polls. The watchdog thread samples
         # this every 60s to detect the 2026-04-21-style wedge where the
@@ -951,6 +961,26 @@ class Dashboard:
                     ui.tab("Quick Screen").style(f"color: {TEXT_PRIMARY};")
                     if cfg.tabs.get("quick_screen", True) else None
                 )
+                sta_trades_tab = (
+                    ui.tab("STA Trades").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("sta_trades", True) else None
+                )
+                sta_slates_tab = (
+                    ui.tab("STA Slates").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("sta_slates", True) else None
+                )
+                sta_chain_tab = (
+                    ui.tab("STA Chain").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("sta_chain", True) else None
+                )
+                sta_lifecycle_tab = (
+                    ui.tab("STA Lifecycle").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("sta_lifecycle", True) else None
+                )
+                sta_health_tab = (
+                    ui.tab("STA Health").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("sta_health", True) else None
+                )
 
             # Restore the last-selected tab across page reloads via per-browser
             # user storage. Falls back to the first enabled tab if the saved
@@ -964,6 +994,11 @@ class Dashboard:
                     ("Crypto", crypto_tab),
                     ("Vuln", vuln_tab),
                     ("Quick Screen", qs_tab),
+                    ("STA Trades", sta_trades_tab),
+                    ("STA Slates", sta_slates_tab),
+                    ("STA Chain", sta_chain_tab),
+                    ("STA Lifecycle", sta_lifecycle_tab),
+                    ("STA Health", sta_health_tab),
                 ) if t is not None
             ]
             saved_tab = app.storage.user.get("active_tab")
@@ -2833,6 +2868,418 @@ class Dashboard:
 
                     ui.timer(0, _init_qs_tab, once=True)
 
+              # ================ STA TRADES TAB ================
+              # One row per lifecycle record from the latest STA heartbeat.
+              # Mirrors Open Trades in layout; lifecycle-state-aware badges.
+              if sta_trades_tab is not None:
+                with ui.tab_panel(sta_trades_tab):
+                    _STA_STATE_COLORS = {
+                        "AUTHORED":        TEXT_SECONDARY,
+                        "GATE_PENDING":    YELLOW,
+                        "DISPATCHED":      BLUE,
+                        "ACTIVE":          GREEN,
+                        "MILESTONE_CHECK": YELLOW,
+                        "PARTIAL_CLOSED":  YELLOW,
+                        "CLOSED":          TEXT_SECONDARY,
+                    }
+                    ui.label("STA Active Trades").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    sta_trades_columns = [
+                        {"name": "record_id",   "label": "Record ID",  "field": "record_id",   "align": "left",  "sortable": True},
+                        {"name": "spec_id",     "label": "Spec",       "field": "spec_id",     "align": "left",  "sortable": True},
+                        {"name": "state",       "label": "State",      "field": "state",       "align": "center","sortable": True},
+                        {"name": "active_legs", "label": "Legs",       "field": "active_legs", "align": "center","sortable": True},
+                        {"name": "pnl_bps",     "label": "P&L (bps)",  "field": "pnl_bps",     "align": "right", "sortable": True, "sort": "numeric"},
+                        {"name": "entry_ts",    "label": "Entry",      "field": "entry_ts",    "align": "left",  "sortable": True},
+                        {"name": "age",         "label": "Age",        "field": "age",         "align": "right", "sortable": True},
+                        {"name": "milestone",   "label": "Next Milestone / Notes", "field": "milestone", "align": "left"},
+                    ]
+                    sta_trades_table = ui.table(
+                        columns=sta_trades_columns, rows=[], row_key="record_id",
+                    ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
+                    sta_trades_table.add_slot("body-cell-state", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.state_color,
+                                border: '1px solid ' + props.row.state_color,
+                                borderRadius: '4px',
+                                padding: '2px 7px',
+                                fontSize: '11px',
+                                fontWeight: 'bold',
+                            }">{{ props.row.state }}</span>
+                        </q-td>
+                    """)
+                    sta_trades_table.add_slot("body-cell-pnl_bps", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.pnl_raw > 0 ? '""" + GREEN + r"""'
+                                     : props.row.pnl_raw < 0 ? '""" + RED + r"""'
+                                     : '""" + TEXT_SECONDARY + r"""',
+                                fontWeight: 'bold'
+                            }">{{ props.row.pnl_bps }}</span>
+                        </q-td>
+                    """)
+
+                    _sta_trades_status = ui.label(
+                        "Waiting for first STA heartbeat on tcp://127.0.0.1:5570…"
+                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 6px;")
+
+                    def update_sta_trades():
+                        with dashboard._lock:
+                            snap = dashboard._sta_latest
+                            last_ts = dashboard._sta_last_ts
+                        if snap is None:
+                            return
+                        age_s = time.time() - last_ts
+                        _sta_trades_status.set_text(
+                            f"STA heartbeat: {_fmt_age(age_s)} ago  ·  v{snap.get('version', '?')}"
+                        )
+                        _sta_trades_status.style(
+                            replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
+                        )
+                        rows = []
+                        for rec in (snap.get("lifecycle") or []):
+                            rid    = rec.get("record_id") or rec.get("spec_id") or "?"
+                            state  = rec.get("state", "?")
+                            pnl    = rec.get("current_pnl_bps")
+                            pnl_s  = (f"+{pnl:.1f}" if pnl is not None and pnl >= 0
+                                      else f"{pnl:.1f}" if pnl is not None else "—")
+                            sched  = rec.get("scheduled_entry") or ""
+                            # Age from scheduled_entry if present
+                            try:
+                                from datetime import datetime as _dt, timezone as _tz
+                                entry_dt = _dt.fromisoformat(sched.replace("Z", "+00:00"))
+                                age_entry = _fmt_age(
+                                    (time.time() - entry_dt.timestamp()))
+                            except Exception:
+                                age_entry = "—"
+                            rows.append({
+                                "record_id":   rid,
+                                "spec_id":     rec.get("spec_id", "?"),
+                                "state":       state,
+                                "state_color": _STA_STATE_COLORS.get(state, TEXT_SECONDARY),
+                                "active_legs": str(rec.get("active_legs", "—")),
+                                "pnl_bps":     pnl_s,
+                                "pnl_raw":     pnl if pnl is not None else 0.0,
+                                "entry_ts":    sched[:19] if sched else "—",
+                                "age":         age_entry,
+                                "milestone":   rec.get("scheduled_entry", ""),
+                            })
+                        if not rows:
+                            rows = [{"record_id": "—", "spec_id": "—", "state": "—",
+                                     "state_color": TEXT_SECONDARY, "active_legs": "—",
+                                     "pnl_bps": "—", "pnl_raw": 0.0,
+                                     "entry_ts": "—", "age": "—", "milestone": "no active trades"}]
+                        sta_trades_table.rows = rows
+                        sta_trades_table.update()
+
+                    ui.timer(2.0, update_sta_trades)
+
+              # ================ STA SLATES TAB ================
+              if sta_slates_tab is not None:
+                with ui.tab_panel(sta_slates_tab):
+                    ui.label("STA Slate Composition").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    # Slates: slate-level constraints per operator's STA spec.
+                    # SC1 = defined-risk count, SC2 = hawkish-hedge slot,
+                    # SC3 = short-convex count, Q3 = factor-diversity tally.
+                    sta_slates_columns = [
+                        {"name": "slate_id",     "label": "Slate",         "field": "slate_id",     "align": "left",  "sortable": True},
+                        {"name": "constructs",   "label": "Constructs",    "field": "constructs",   "align": "center","sortable": True},
+                        {"name": "sc1_count",    "label": "SC1 (def-risk)","field": "sc1_count",    "align": "center","sortable": True},
+                        {"name": "sc2_status",   "label": "SC2 (hedge)",   "field": "sc2_status",   "align": "center","sortable": False},
+                        {"name": "sc3_count",    "label": "SC3 (short-cvx)","field": "sc3_count",   "align": "center","sortable": True},
+                        {"name": "q3_diversity", "label": "Q3 (diversity)","field": "q3_diversity", "align": "center","sortable": True},
+                        {"name": "status",       "label": "Status",        "field": "status",       "align": "center","sortable": True},
+                    ]
+                    sta_slates_table = ui.table(
+                        columns=sta_slates_columns, rows=[], row_key="slate_id",
+                    ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
+
+                    _sta_slates_status = ui.label(
+                        "Waiting for STA slate data…"
+                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 6px;")
+
+                    def update_sta_slates():
+                        with dashboard._lock:
+                            snap = dashboard._sta_latest
+                        if snap is None:
+                            return
+                        slates = snap.get("slates") or []
+                        if not slates:
+                            _sta_slates_status.set_text(
+                                "No slate data in heartbeat — STA may not emit slates yet."
+                            )
+                            _sta_slates_status.style(
+                                replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
+                            )
+                            return
+                        _sta_slates_status.set_text("")
+                        rows = []
+                        for s in slates:
+                            rows.append({
+                                "slate_id":     s.get("slate_id", "?"),
+                                "constructs":   str(s.get("construct_count", "—")),
+                                "sc1_count":    str(s.get("sc1_defined_risk_count", "—")),
+                                "sc2_status":   s.get("sc2_hawkish_hedge_status", "—"),
+                                "sc3_count":    str(s.get("sc3_short_convex_count", "—")),
+                                "q3_diversity": str(s.get("q3_factor_diversity", "—")),
+                                "status":       s.get("status", "—"),
+                            })
+                        sta_slates_table.rows = rows
+                        sta_slates_table.update()
+
+                    ui.timer(2.0, update_sta_slates)
+
+              # ================ STA CHAIN TAB ================
+              if sta_chain_tab is not None:
+                with ui.tab_panel(sta_chain_tab):
+                    ui.label("STA Options Chain").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    # chain_stats summary grid from heartbeat.
+                    # Full greek surface would require a separate subscription.
+                    chain_summary_columns = [
+                        {"name": "underlying",    "label": "Underlying",       "field": "underlying",    "align": "left",  "sortable": True},
+                        {"name": "expiries",      "label": "Expiries",         "field": "expiries",      "align": "center","sortable": True},
+                        {"name": "strikes_front", "label": "Strikes (front)",  "field": "strikes_front", "align": "center","sortable": True},
+                        {"name": "iv_index",      "label": "IV Index",         "field": "iv_index",      "align": "right", "sortable": True},
+                        {"name": "last_quote_ts", "label": "Last Quote",       "field": "last_quote_ts", "align": "left"},
+                        {"name": "syms_subscribed","label": "Syms Subscribed", "field": "syms_subscribed","align": "center","sortable": True},
+                    ]
+                    chain_summary_table = ui.table(
+                        columns=chain_summary_columns, rows=[], row_key="underlying",
+                    ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
+                    chain_summary_table.add_slot("body-cell-iv_index", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.iv_raw > 0.5 ? '""" + RED + r"""'
+                                     : props.row.iv_raw > 0.3 ? '""" + YELLOW + r"""'
+                                     : '""" + TEXT_PRIMARY + r"""'
+                            }">{{ props.row.iv_index }}</span>
+                        </q-td>
+                    """)
+
+                    _sta_chain_status = ui.label(
+                        "Waiting for STA chain stats…"
+                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 6px;")
+
+                    def update_sta_chain():
+                        with dashboard._lock:
+                            snap = dashboard._sta_latest
+                        if snap is None:
+                            return
+                        chain_stats = snap.get("chain_stats") or {}
+                        dxlink = snap.get("dxlink_status") or {}
+                        syms = dxlink.get("symbols_subscribed", 0)
+                        last_q = dxlink.get("last_quote_ts", "")
+                        rows = []
+                        for underlying, stats in sorted(chain_stats.items()):
+                            iv = stats.get("iv_index")
+                            rows.append({
+                                "underlying":     underlying,
+                                "expiries":       str(stats.get("expiries", "—")),
+                                "strikes_front":  str(stats.get("strikes_front", "—")),
+                                "iv_index":       f"{iv:.4f}" if iv is not None else "—",
+                                "iv_raw":         float(iv) if iv is not None else 0.0,
+                                "last_quote_ts":  last_q[:19] if last_q else "—",
+                                "syms_subscribed": str(syms),
+                            })
+                        if rows:
+                            _sta_chain_status.set_text("")
+                        else:
+                            _sta_chain_status.set_text(
+                                "No chain_stats in heartbeat — STA may not emit chain data yet."
+                            )
+                            _sta_chain_status.style(
+                                replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
+                            )
+                        chain_summary_table.rows = rows
+                        chain_summary_table.update()
+
+                    ui.timer(2.0, update_sta_chain)
+
+              # ================ STA LIFECYCLE TAB ================
+              if sta_lifecycle_tab is not None:
+                with ui.tab_panel(sta_lifecycle_tab):
+                    ui.label("STA Trade Lifecycle Audit").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    # Dropdown of known record_ids; table shows state transitions.
+                    _sta_lc_selected: list[str] = [None]
+
+                    _sta_lc_select = ui.select(
+                        options=[], value=None, label="Select trade",
+                    ).style(f"color: {TEXT_PRIMARY}; min-width: 260px;").props("dense options-dense")
+
+                    lifecycle_cols = [
+                        {"name": "ts",        "label": "Timestamp",  "field": "ts",        "align": "left"},
+                        {"name": "state",     "label": "State",      "field": "state",     "align": "center"},
+                        {"name": "spec_id",   "label": "Spec",       "field": "spec_id",   "align": "left"},
+                    ]
+                    lifecycle_table = ui.table(
+                        columns=lifecycle_cols, rows=[], row_key="ts",
+                        pagination={"rowsPerPage": 50, "sortBy": "ts", "descending": True},
+                    ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
+                    lifecycle_table.add_slot("body-cell-state", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.state_color,
+                                border: '1px solid ' + props.row.state_color,
+                                borderRadius: '4px',
+                                padding: '2px 6px',
+                                fontSize: '11px',
+                                fontWeight: 'bold',
+                            }">{{ props.row.state }}</span>
+                        </q-td>
+                    """)
+
+                    _sta_lc_status = ui.label("").style(
+                        f"color: {TEXT_SECONDARY}; font-size: 12px;"
+                    )
+
+                    def update_sta_lifecycle():
+                        with dashboard._lock:
+                            history = dict(dashboard._sta_lifecycle_history)
+                        known = sorted(history.keys())
+                        if _sta_lc_select.options != known:
+                            _sta_lc_select.options = known
+                            _sta_lc_select.update()
+                            if known and _sta_lc_selected[0] is None:
+                                _sta_lc_selected[0] = known[0]
+                                _sta_lc_select.value = known[0]
+                        sel = _sta_lc_selected[0] or (_sta_lc_select.value if _sta_lc_select.value else None)
+                        if not sel or sel not in history:
+                            _sta_lc_status.set_text(
+                                "Waiting for STA lifecycle data…" if not known
+                                else "Select a trade above."
+                            )
+                            lifecycle_table.rows = []
+                            lifecycle_table.update()
+                            return
+                        transitions = history[sel]
+                        rows = []
+                        for t in transitions:
+                            state = t.get("state", "?")
+                            rows.append({
+                                "ts":          t.get("ts", "")[:19],
+                                "state":       state,
+                                "state_color": {"ACTIVE": GREEN, "CLOSED": TEXT_SECONDARY,
+                                                "GATE_PENDING": YELLOW, "DISPATCHED": BLUE,
+                                                "MILESTONE_CHECK": YELLOW,
+                                                "PARTIAL_CLOSED": YELLOW}.get(state, TEXT_SECONDARY),
+                                "spec_id":     t.get("spec_id", ""),
+                            })
+                        _sta_lc_status.set_text(f"{len(rows)} transition(s) recorded for {sel}")
+                        lifecycle_table.rows = rows
+                        lifecycle_table.update()
+
+                    _sta_lc_select.on("update:model-value",
+                                      lambda e: (_sta_lc_selected.__setitem__(0, e.value),
+                                                 update_sta_lifecycle()))
+                    ui.timer(2.0, update_sta_lifecycle)
+
+              # ================ STA HEALTH TAB ================
+              if sta_health_tab is not None:
+                with ui.tab_panel(sta_health_tab):
+                    ui.label("STA Health").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
+                    )
+                    with ui.row().classes("w-full gap-4 mt-2"):
+                        # Heartbeat summary card
+                        with ui.card().classes("flex-1").style(f"background-color: {BG_PANEL};"):
+                            ui.label("Heartbeat").style(
+                                f"color: {TEXT_SECONDARY}; font-weight: bold;"
+                            )
+                            _sta_hb_label = ui.label("Waiting…").style(
+                                f"color: {YELLOW}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
+                            )
+                        # DXLink status card
+                        with ui.card().classes("flex-1").style(f"background-color: {BG_PANEL};"):
+                            ui.label("DXLink Subscriber").style(
+                                f"color: {TEXT_SECONDARY}; font-weight: bold;"
+                            )
+                            _sta_dxlink_label = ui.label("—").style(
+                                f"color: {TEXT_PRIMARY}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
+                            )
+                        # Schedule engine card
+                        with ui.card().classes("flex-1").style(f"background-color: {BG_PANEL};"):
+                            ui.label("Schedule Engine").style(
+                                f"color: {TEXT_SECONDARY}; font-weight: bold;"
+                            )
+                            _sta_engine_label = ui.label("—").style(
+                                f"color: {TEXT_PRIMARY}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
+                            )
+
+                    # Errors table
+                    ui.label("Recent Errors").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;"
+                    )
+                    sta_errors_table = ui.table(
+                        columns=[
+                            {"name": "ts",      "label": "Time",    "field": "ts",      "align": "left"},
+                            {"name": "message", "label": "Message", "field": "message", "align": "left"},
+                            {"name": "context", "label": "Context", "field": "context", "align": "left"},
+                        ],
+                        rows=[], row_key="ts",
+                    ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
+                    sta_errors_table.add_slot("body-cell-message", r"""
+                        <q-td :props="props">
+                            <span :style="{color: '""" + RED + r"""'}">{{ props.row.message }}</span>
+                        </q-td>
+                    """)
+
+                    def update_sta_health():
+                        with dashboard._lock:
+                            snap = dashboard._sta_latest
+                            last_ts = dashboard._sta_last_ts
+                        if snap is None:
+                            return
+                        age_s = time.time() - last_ts
+                        age_color = (GREEN if age_s < 30
+                                     else YELLOW if age_s < 120 else RED)
+                        _sta_hb_label.set_text(
+                            f"Age:      {_fmt_age(age_s)} ago\n"
+                            f"Version:  {snap.get('version', '?')}\n"
+                            f"PID:      {snap.get('schedule_engine_pid', '?')}\n"
+                            f"TS:       {(snap.get('ts') or '')[:19]}"
+                        )
+                        _sta_hb_label.style(
+                            replace=f"color: {age_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
+                        )
+                        dx = snap.get("dxlink_status") or {}
+                        _sta_dxlink_label.set_text(
+                            f"Symbols:   {dx.get('symbols_subscribed', '—')}\n"
+                            f"Last quote: {(dx.get('last_quote_ts') or '')[:19]}"
+                        )
+                        pid = snap.get("schedule_engine_pid")
+                        pid_color = GREEN if pid else RED
+                        _sta_engine_label.set_text(
+                            f"PID: {pid or 'not running'}"
+                        )
+                        _sta_engine_label.style(
+                            replace=f"color: {pid_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
+                        )
+                        errs = snap.get("errors_recent") or []
+                        err_rows = []
+                        for i, e in enumerate(errs[:20]):
+                            if isinstance(e, str):
+                                err_rows.append({"ts": str(i), "message": e, "context": ""})
+                            else:
+                                err_rows.append({
+                                    "ts":      (e.get("ts") or str(i))[:19],
+                                    "message": e.get("message") or e.get("error") or str(e),
+                                    "context": e.get("context") or e.get("spec_id") or "",
+                                })
+                        if not err_rows:
+                            err_rows = [{"ts": "—", "message": "no errors", "context": ""}]
+                        sta_errors_table.rows = err_rows
+                        sta_errors_table.update()
+
+                    ui.timer(2.0, update_sta_health)
+
             # ---- Periodic UI update — Console tab refresh ----
             # Skipped when Console tab is disabled.
             if console_tab is not None:
@@ -3893,6 +4340,10 @@ class Dashboard:
             target=self._mfe_mae_loop, name="zmqgui-mfemae", daemon=True,
         )
         self._mfe_mae_thread.start()
+        self._sta_feed_thread = threading.Thread(
+            target=self._sta_feed_loop, name="zmqgui-sta", daemon=True,
+        )
+        self._sta_feed_thread.start()
 
     def _watchdog_loop(self, interval_s: float = 60.0,
                         stall_threshold: int = 3) -> None:
@@ -4073,6 +4524,50 @@ class Dashboard:
 
         sub.close()
         bus.close()
+
+    def _sta_feed_loop(self):
+        """SUB socket for StructuredTradeApp heartbeats on tcp://127.0.0.1:5570.
+
+        Topic prefix: 'sta.heartbeat.'. Separate port from MTA (:5552) so
+        subscribing to one doesn't pull the other. Stays alive and retries
+        the connection so the tab shows live data the moment STA starts.
+        """
+        endpoint = self.cfg.sta.endpoint
+        bus = Bus()
+        sub = bus.subscriber(endpoint, ["sta.heartbeat."])
+        poller = zmq.Poller()
+        poller.register(sub, zmq.POLLIN)
+        logger.info("STA feed loop started on %s", endpoint)
+        while self._zmq_running:
+            events = dict(poller.poll(timeout=500))
+            if sub not in events:
+                continue
+            try:
+                msg = Bus.sub_recv(sub)
+            except Exception:
+                logger.debug("STA ZMQ recv error", exc_info=True)
+                continue
+            self._on_sta_heartbeat(msg)
+        sub.close()
+        bus.close()
+
+    def _on_sta_heartbeat(self, msg: dict):
+        """Store latest STA heartbeat; update lifecycle transition history."""
+        with self._lock:
+            self._sta_latest = msg
+            self._sta_last_ts = time.time()
+            for rec in (msg.get("lifecycle") or []):
+                rid = rec.get("record_id") or rec.get("spec_id") or "?"
+                history = self._sta_lifecycle_history.setdefault(rid, [])
+                new_state = rec.get("state", "?")
+                last_state = history[-1].get("state") if history else None
+                if new_state != last_state:
+                    history.append({
+                        "ts": msg.get("ts", ""),
+                        "state": new_state,
+                        "record_id": rid,
+                        "spec_id": rec.get("spec_id", ""),
+                    })
 
     def _process_message(self, msg: dict):
         topic = msg.get("topic", "")
