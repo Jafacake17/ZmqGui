@@ -265,6 +265,65 @@ def _short_cond_label(full: str) -> str:
     return full
 
 
+def _fmt_countdown(seconds) -> str:
+    """Format a seconds-until-event as a compact countdown: "2d 3h", "4h 12m", "8m 30s"."""
+    if seconds is None:
+        return "—"
+    s = max(0, int(seconds))
+    if s >= 86400:
+        return f"{s // 86400}d {(s % 86400) // 3600}h"
+    if s >= 3600:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    if s >= 60:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s}s"
+
+
+def _fmt_legs(legs: list) -> str:
+    """Condense STA leg list into 'SHORT 222.5P / LONG 215P NVDA 2026-05-22'."""
+    if not legs:
+        return "—"
+    parts = []
+    underlying = ""
+    expiry = ""
+    for leg in legs:
+        c = leg.get("contract") or {}
+        raw_side = (leg.get("side") or "").upper()
+        side = "LONG" if raw_side in ("BUY", "LONG") else "SHORT"
+        strike = leg.get("qty", "")  # qty as fallback label
+        strike = c.get("strike", strike)
+        right = (c.get("right") or "")[:1].upper()
+        if not underlying:
+            underlying = c.get("underlying", "")
+            expiry = (c.get("expiry") or "")[:10]
+        parts.append(f"{side} {strike}{right}")
+    result = " / ".join(parts)
+    if underlying:
+        result += f"  {underlying} {expiry}"
+    return result
+
+
+def _build_gate_chips(gate_trace: list) -> list:
+    """Build chip list from STA gate_trace — same pattern as MTA entry_trace chips."""
+    from .theme import GREEN, RED, YELLOW, TEXT_SECONDARY
+    chips = []
+    for g in (gate_trace or []):
+        passed = g.get("passed")
+        indicator = g.get("indicator") or g.get("gate_id") or "?"
+        op = g.get("op", "")
+        threshold = g.get("threshold")
+        observed = g.get("observed")
+        thr_s = _fmt_trace_num(threshold)
+        obs_s = _fmt_trace_num(observed) if observed is not None else "?"
+        label = f"{indicator}: {obs_s} {op} {thr_s}"
+        blocker = g.get("blocker_reason")
+        if blocker and passed is False:
+            label += f" ({blocker})"
+        color = GREEN if passed is True else RED if passed is False else YELLOW
+        chips.append({"label": label, "color": color})
+    return chips
+
+
 def _build_strategy_rows(strategies: dict,
                           allowed_strats: set | None,
                           strat_to_scenarios: dict,
@@ -2886,14 +2945,18 @@ class Dashboard:
                         f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
                     )
                     sta_trades_columns = [
-                        {"name": "record_id",   "label": "Record ID",  "field": "record_id",   "align": "left",  "sortable": True},
-                        {"name": "spec_id",     "label": "Spec",       "field": "spec_id",     "align": "left",  "sortable": True},
-                        {"name": "state",       "label": "State",      "field": "state",       "align": "center","sortable": True},
-                        {"name": "active_legs", "label": "Legs",       "field": "active_legs", "align": "center","sortable": True},
-                        {"name": "pnl_bps",     "label": "P&L (bps)",  "field": "pnl_bps",     "align": "right", "sortable": True, "sort": "numeric"},
-                        {"name": "entry_ts",    "label": "Entry",      "field": "entry_ts",    "align": "left",  "sortable": True},
-                        {"name": "age",         "label": "Age",        "field": "age",         "align": "right", "sortable": True},
-                        {"name": "milestone",   "label": "Next Milestone / Notes", "field": "milestone", "align": "left"},
+                        {"name": "record_id",    "label": "Record ID",          "field": "record_id",    "align": "left",   "sortable": True},
+                        {"name": "spec_id",      "label": "Spec",               "field": "spec_id",      "align": "left",   "sortable": True},
+                        {"name": "state",        "label": "State",              "field": "state",        "align": "center", "sortable": True},
+                        {"name": "legs",         "label": "Legs",               "field": "legs",         "align": "left"},
+                        {"name": "entry_credit", "label": "Entry Credit (USD)", "field": "entry_credit", "align": "right",  "sortable": True},
+                        {"name": "mark",         "label": "Mark",               "field": "mark",         "align": "right",  "sortable": True},
+                        {"name": "pnl_usd",      "label": "P&L (USD)",          "field": "pnl_usd",      "align": "right",  "sortable": True},
+                        {"name": "pnl_bps",      "label": "P&L (bps)",          "field": "pnl_bps",      "align": "right",  "sortable": True, "sort": "numeric"},
+                        {"name": "countdown",    "label": "Countdown",          "field": "countdown",    "align": "right"},
+                        {"name": "gate_chips",   "label": "Gate Status",        "field": "gate_chips",   "align": "left"},
+                        {"name": "entry_ts",     "label": "Entry",              "field": "entry_ts",     "align": "left",   "sortable": True},
+                        {"name": "age",          "label": "Age",                "field": "age",          "align": "right",  "sortable": True},
                     ]
                     sta_trades_table = ui.table(
                         columns=sta_trades_columns, rows=[], row_key="record_id",
@@ -2920,6 +2983,33 @@ class Dashboard:
                             }">{{ props.row.pnl_bps }}</span>
                         </q-td>
                     """)
+                    sta_trades_table.add_slot("body-cell-pnl_usd", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.pnl_usd_raw > 0 ? '""" + GREEN + r"""'
+                                     : props.row.pnl_usd_raw < 0 ? '""" + RED + r"""'
+                                     : '""" + TEXT_SECONDARY + r"""',
+                                fontWeight: 'bold'
+                            }">{{ props.row.pnl_usd }}</span>
+                        </q-td>
+                    """)
+                    # Gate chips: coloured spans per gate indicator — same pattern
+                    # as MTA's condition chips so operators have one familiar idiom.
+                    sta_trades_table.add_slot("body-cell-gate_chips", r"""
+                        <q-td :props="props" style="vertical-align: top; padding: 4px 8px;">
+                            <div style="display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px; line-height: 1.4; max-height: 80px; overflow-y: auto;">
+                                <span v-for="chip in props.row.gate_chips"
+                                      :key="chip.label"
+                                      :style="{
+                                        color: chip.color,
+                                        border: '1px solid ' + chip.color,
+                                        borderRadius: '3px',
+                                        padding: '1px 5px',
+                                        whiteSpace: 'nowrap',
+                                      }">{{ chip.label }}</span>
+                            </div>
+                        </q-td>
+                    """)
 
                     _sta_trades_status = ui.label(
                         "Waiting for first STA heartbeat on tcp://127.0.0.1:5570…"
@@ -2940,37 +3030,69 @@ class Dashboard:
                         )
                         rows = []
                         for rec in (snap.get("lifecycle") or []):
-                            rid    = rec.get("record_id") or rec.get("spec_id") or "?"
-                            state  = rec.get("state", "?")
-                            pnl    = rec.get("current_pnl_bps")
-                            pnl_s  = (f"+{pnl:.1f}" if pnl is not None and pnl >= 0
-                                      else f"{pnl:.1f}" if pnl is not None else "—")
+                            rid   = rec.get("record_id") or rec.get("spec_id") or "?"
+                            state = rec.get("state", "?")
+                            pnl   = rec.get("current_pnl_bps")
+                            pnl_s = (f"+{pnl:.1f}" if pnl is not None and pnl >= 0
+                                     else f"{pnl:.1f}" if pnl is not None else "—")
+                            upnl      = rec.get("unrealised_pnl")
+                            upnl_s    = (f"+{upnl:.2f}" if upnl is not None and upnl >= 0
+                                         else f"{upnl:.2f}" if upnl is not None else "—")
+                            ecredit   = rec.get("entry_credit")
+                            ecredit_s = (f"+{ecredit:.2f}" if ecredit is not None and ecredit >= 0
+                                         else f"{ecredit:.2f}" if ecredit is not None else "—")
+                            mark   = rec.get("current_mark")
+                            mark_s = f"{mark:.2f}" if mark is not None else "—"
                             sched  = rec.get("scheduled_entry") or ""
-                            # Age from scheduled_entry if present
                             try:
-                                from datetime import datetime as _dt, timezone as _tz
+                                from datetime import datetime as _dt
                                 entry_dt = _dt.fromisoformat(sched.replace("Z", "+00:00"))
-                                age_entry = _fmt_age(
-                                    (time.time() - entry_dt.timestamp()))
+                                age_entry = _fmt_age(time.time() - entry_dt.timestamp())
                             except Exception:
                                 age_entry = "—"
+                            # Countdown: whichever is sooner — time_stop or expiry
+                            ts_stop = rec.get("time_to_time_stop_seconds")
+                            ts_exp  = rec.get("time_to_expiry_seconds")
+                            if ts_stop is not None and ts_exp is not None:
+                                countdown = _fmt_countdown(min(ts_stop, ts_exp))
+                            elif ts_stop is not None:
+                                countdown = _fmt_countdown(ts_stop)
+                            elif ts_exp is not None:
+                                countdown = _fmt_countdown(ts_exp)
+                            else:
+                                countdown = "—"
+                            # Gate chips for GATE_PENDING; empty list otherwise
+                            gate_chips = (
+                                _build_gate_chips(rec.get("gate_trace") or [])
+                                if state == "GATE_PENDING" else []
+                            )
                             rows.append({
-                                "record_id":   rid,
-                                "spec_id":     rec.get("spec_id", "?"),
-                                "state":       state,
-                                "state_color": _STA_STATE_COLORS.get(state, TEXT_SECONDARY),
-                                "active_legs": str(rec.get("active_legs", "—")),
-                                "pnl_bps":     pnl_s,
-                                "pnl_raw":     pnl if pnl is not None else 0.0,
-                                "entry_ts":    sched[:19] if sched else "—",
-                                "age":         age_entry,
-                                "milestone":   rec.get("scheduled_entry", ""),
+                                "record_id":    rid,
+                                "spec_id":      rec.get("spec_id", "?"),
+                                "state":        state,
+                                "state_color":  _STA_STATE_COLORS.get(state, TEXT_SECONDARY),
+                                "legs":         _fmt_legs(rec.get("legs") or []),
+                                "entry_credit": ecredit_s,
+                                "mark":         mark_s,
+                                "pnl_usd":      upnl_s,
+                                "pnl_usd_raw":  upnl if upnl is not None else 0.0,
+                                "pnl_bps":      pnl_s,
+                                "pnl_raw":      pnl if pnl is not None else 0.0,
+                                "countdown":    countdown,
+                                "gate_chips":   gate_chips,
+                                "entry_ts":     sched[:19] if sched else "—",
+                                "age":          age_entry,
                             })
                         if not rows:
-                            rows = [{"record_id": "—", "spec_id": "—", "state": "—",
-                                     "state_color": TEXT_SECONDARY, "active_legs": "—",
-                                     "pnl_bps": "—", "pnl_raw": 0.0,
-                                     "entry_ts": "—", "age": "—", "milestone": "no active trades"}]
+                            _empty = {"record_id": "—", "spec_id": "—", "state": "—",
+                                      "state_color": TEXT_SECONDARY, "legs": "—",
+                                      "entry_credit": "—", "mark": "—",
+                                      "pnl_usd": "—", "pnl_usd_raw": 0.0,
+                                      "pnl_bps": "—", "pnl_raw": 0.0,
+                                      "countdown": "—", "gate_chips": [],
+                                      "entry_ts": "—", "age": "—"}
+                            _empty["spec_id"] = "no active trades"
+                            rows = [_empty]
                         sta_trades_table.rows = rows
                         sta_trades_table.update()
 
@@ -3039,26 +3161,30 @@ class Dashboard:
                     ui.label("STA Options Chain").classes("mt-4").style(
                         f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
                     )
-                    # chain_stats summary grid from heartbeat.
-                    # Full greek surface would require a separate subscription.
+                    # Per-underlying summary. Reads enriched chain_status first
+                    # (strikes_loaded, strikes_with_greeks, spot_estimate, etc.),
+                    # falls back to legacy chain_stats summary format.
                     chain_summary_columns = [
-                        {"name": "underlying",    "label": "Underlying",       "field": "underlying",    "align": "left",  "sortable": True},
-                        {"name": "expiries",      "label": "Expiries",         "field": "expiries",      "align": "center","sortable": True},
-                        {"name": "strikes_front", "label": "Strikes (front)",  "field": "strikes_front", "align": "center","sortable": True},
-                        {"name": "iv_index",      "label": "IV Index",         "field": "iv_index",      "align": "right", "sortable": True},
-                        {"name": "last_quote_ts", "label": "Last Quote",       "field": "last_quote_ts", "align": "left"},
-                        {"name": "syms_subscribed","label": "Syms Subscribed", "field": "syms_subscribed","align": "center","sortable": True},
+                        {"name": "underlying",    "label": "Underlying",      "field": "underlying",    "align": "left",  "sortable": True},
+                        {"name": "spot",          "label": "Spot",            "field": "spot",          "align": "right", "sortable": True},
+                        {"name": "strikes_loaded","label": "Strikes",         "field": "strikes_loaded","align": "center","sortable": True},
+                        {"name": "greeks_pct",    "label": "Greeks %",        "field": "greeks_pct",    "align": "right", "sortable": True},
+                        {"name": "last_quote",    "label": "Last Quote",      "field": "last_quote",    "align": "left"},
+                        {"name": "last_greeks",   "label": "Last Greeks",     "field": "last_greeks",   "align": "left"},
                     ]
                     chain_summary_table = ui.table(
                         columns=chain_summary_columns, rows=[], row_key="underlying",
                     ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
-                    chain_summary_table.add_slot("body-cell-iv_index", r"""
+                    # Greeks % colour: green >80%, yellow 50-80%, red <50%
+                    chain_summary_table.add_slot("body-cell-greeks_pct", r"""
                         <q-td :props="props">
                             <span :style="{
-                                color: props.row.iv_raw > 0.5 ? '""" + RED + r"""'
-                                     : props.row.iv_raw > 0.3 ? '""" + YELLOW + r"""'
-                                     : '""" + TEXT_PRIMARY + r"""'
-                            }">{{ props.row.iv_index }}</span>
+                                color: props.row.greeks_pct_raw > 80 ? '""" + GREEN + r"""'
+                                     : props.row.greeks_pct_raw > 50 ? '""" + YELLOW + r"""'
+                                     : props.row.greeks_pct_raw >= 0  ? '""" + RED + r"""'
+                                     : '""" + TEXT_SECONDARY + r"""',
+                                fontWeight: 'bold'
+                            }">{{ props.row.greeks_pct }}</span>
                         </q-td>
                     """)
 
@@ -3066,32 +3192,113 @@ class Dashboard:
                         "Waiting for STA chain stats…"
                     ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 6px;")
 
+                    # Expiry sub-table — populated for the selected underlying
+                    ui.label("Expiries").classes("mt-4").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;"
+                    )
+                    _sta_chain_ul_select = ui.select(
+                        options=[], value=None, label="Underlying",
+                    ).style(f"color: {TEXT_PRIMARY}; min-width: 120px;").props("dense options-dense")
+
+                    expiry_table = ui.table(
+                        columns=[
+                            {"name": "expiry",   "label": "Expiry",    "field": "expiry",   "align": "left",  "sortable": True},
+                            {"name": "strikes",  "label": "Strikes",   "field": "strikes",  "align": "center","sortable": True},
+                            {"name": "atm_iv",   "label": "ATM IV",    "field": "atm_iv",   "align": "right", "sortable": True},
+                        ],
+                        rows=[], row_key="expiry",
+                        pagination={"rowsPerPage": 30, "sortBy": "expiry"},
+                    ).classes("w-full mt-1").style(f"background-color: {BG_PANEL};")
+                    expiry_table.add_slot("body-cell-atm_iv", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.atm_iv_raw > 0.5 ? '""" + RED + r"""'
+                                     : props.row.atm_iv_raw > 0.3 ? '""" + YELLOW + r"""'
+                                     : '""" + TEXT_PRIMARY + r"""'
+                            }">{{ props.row.atm_iv }}</span>
+                        </q-td>
+                    """)
+
+                    _sta_chain_snap_cache: list[dict] = [None]
+
+                    def _rebuild_expiry_table():
+                        snap = _sta_chain_snap_cache[0]
+                        sel  = _sta_chain_ul_select.value
+                        if not snap or not sel:
+                            expiry_table.rows = []
+                            expiry_table.update()
+                            return
+                        cs    = snap.get("chain_status") or {}
+                        stats = cs.get(sel) or {}
+                        exps  = stats.get("expiries") or []
+                        rows  = []
+                        for ex in sorted(exps, key=lambda x: x.get("expiry", "")):
+                            iv = ex.get("atm_iv")
+                            rows.append({
+                                "expiry":     ex.get("expiry", "—"),
+                                "strikes":    str(ex.get("strikes", "—")),
+                                "atm_iv":     f"{iv:.4f}" if iv is not None else "—",
+                                "atm_iv_raw": float(iv) if iv is not None else -1.0,
+                            })
+                        expiry_table.rows = rows or [{"expiry": "—", "strikes": "—", "atm_iv": "—", "atm_iv_raw": -1.0}]
+                        expiry_table.update()
+
+                    _sta_chain_ul_select.on("update:model-value",
+                                            lambda e: _rebuild_expiry_table())
+
                     def update_sta_chain():
                         with dashboard._lock:
                             snap = dashboard._sta_latest
                         if snap is None:
                             return
-                        chain_stats = snap.get("chain_stats") or {}
-                        dxlink = snap.get("dxlink_status") or {}
-                        syms = dxlink.get("symbols_subscribed", 0)
-                        last_q = dxlink.get("last_quote_ts", "")
+                        _sta_chain_snap_cache[0] = snap
+                        # Prefer enriched chain_status; fall back to chain_stats
+                        chain_status = snap.get("chain_status") or {}
+                        chain_stats  = snap.get("chain_stats") or {}
+                        source = chain_status if chain_status else chain_stats
                         rows = []
-                        for underlying, stats in sorted(chain_stats.items()):
-                            iv = stats.get("iv_index")
+                        for underlying, stats in sorted(source.items()):
+                            # Enriched path (chain_status)
+                            if chain_status:
+                                loaded  = stats.get("strikes_loaded")
+                                greek   = stats.get("strikes_with_greeks")
+                                pct_raw = (greek / loaded * 100.0
+                                           if loaded and greek is not None else -1.0)
+                                pct_s   = f"{pct_raw:.0f}%" if pct_raw >= 0 else "—"
+                                spot    = stats.get("spot_estimate")
+                                lqt     = stats.get("last_quote_ts") or ""
+                                lgt     = stats.get("last_greeks_ts") or ""
+                            else:
+                                # Legacy chain_stats summary
+                                iv      = stats.get("iv_index")
+                                loaded  = stats.get("strikes_front")
+                                pct_raw = -1.0
+                                pct_s   = f"{stats.get('iv_index', '—')}"
+                                spot    = None
+                                lqt     = (snap.get("dxlink_status") or {}).get("last_quote_ts", "")
+                                lgt     = ""
                             rows.append({
                                 "underlying":     underlying,
-                                "expiries":       str(stats.get("expiries", "—")),
-                                "strikes_front":  str(stats.get("strikes_front", "—")),
-                                "iv_index":       f"{iv:.4f}" if iv is not None else "—",
-                                "iv_raw":         float(iv) if iv is not None else 0.0,
-                                "last_quote_ts":  last_q[:19] if last_q else "—",
-                                "syms_subscribed": str(syms),
+                                "spot":           f"{spot:.4f}" if spot else "—",
+                                "strikes_loaded": str(loaded) if loaded is not None else "—",
+                                "greeks_pct":     pct_s,
+                                "greeks_pct_raw": pct_raw,
+                                "last_quote":     lqt[:19] if lqt else "—",
+                                "last_greeks":    lgt[:19] if lgt else "—",
                             })
                         if rows:
                             _sta_chain_status.set_text("")
+                            # Sync underlying selector
+                            underlyings = [r["underlying"] for r in rows]
+                            if _sta_chain_ul_select.options != underlyings:
+                                _sta_chain_ul_select.options = underlyings
+                                _sta_chain_ul_select.update()
+                                if not _sta_chain_ul_select.value and underlyings:
+                                    _sta_chain_ul_select.value = underlyings[0]
+                            _rebuild_expiry_table()
                         else:
                             _sta_chain_status.set_text(
-                                "No chain_stats in heartbeat — STA may not emit chain data yet."
+                                "No chain_status/chain_stats in heartbeat — STA may not emit chain data yet."
                             )
                             _sta_chain_status.style(
                                 replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
@@ -3115,9 +3322,10 @@ class Dashboard:
                     ).style(f"color: {TEXT_PRIMARY}; min-width: 260px;").props("dense options-dense")
 
                     lifecycle_cols = [
-                        {"name": "ts",        "label": "Timestamp",  "field": "ts",        "align": "left"},
-                        {"name": "state",     "label": "State",      "field": "state",     "align": "center"},
-                        {"name": "spec_id",   "label": "Spec",       "field": "spec_id",   "align": "left"},
+                        {"name": "ts",        "label": "Timestamp",        "field": "ts",        "align": "left"},
+                        {"name": "state",     "label": "State",            "field": "state",     "align": "center"},
+                        {"name": "spec_id",   "label": "Spec",             "field": "spec_id",   "align": "left"},
+                        {"name": "gate_note", "label": "Gate / Reason",    "field": "gate_note", "align": "left"},
                     ]
                     lifecycle_table = ui.table(
                         columns=lifecycle_cols, rows=[], row_key="ts",
@@ -3163,6 +3371,13 @@ class Dashboard:
                         rows = []
                         for t in transitions:
                             state = t.get("state", "?")
+                            # Build gate note from stored gate_trace blockers
+                            gate_trace = t.get("gate_trace") or []
+                            blockers = [g.get("blocker_reason") or ""
+                                        for g in gate_trace if not g.get("passed")]
+                            gate_note = "; ".join(b for b in blockers if b)
+                            if not gate_note:
+                                gate_note = t.get("last_reason", "")
                             rows.append({
                                 "ts":          t.get("ts", "")[:19],
                                 "state":       state,
@@ -3171,6 +3386,7 @@ class Dashboard:
                                                 "MILESTONE_CHECK": YELLOW,
                                                 "PARTIAL_CLOSED": YELLOW}.get(state, TEXT_SECONDARY),
                                 "spec_id":     t.get("spec_id", ""),
+                                "gate_note":   gate_note,
                             })
                         _sta_lc_status.set_text(f"{len(rows)} transition(s) recorded for {sel}")
                         lifecycle_table.rows = rows
@@ -3219,9 +3435,9 @@ class Dashboard:
                     )
                     sta_errors_table = ui.table(
                         columns=[
-                            {"name": "ts",      "label": "Time",    "field": "ts",      "align": "left"},
-                            {"name": "message", "label": "Message", "field": "message", "align": "left"},
-                            {"name": "context", "label": "Context", "field": "context", "align": "left"},
+                            {"name": "ts",        "label": "Time",      "field": "ts",        "align": "left"},
+                            {"name": "message",   "label": "Message",   "field": "message",   "align": "left"},
+                            {"name": "record_id", "label": "Record ID", "field": "record_id", "align": "left"},
                         ],
                         rows=[], row_key="ts",
                     ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
@@ -3250,9 +3466,43 @@ class Dashboard:
                             replace=f"color: {age_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
                         )
                         dx = snap.get("dxlink_status") or {}
+                        # DXLink freshness: prefer chain_status per-underlying timestamps
+                        # (enriched), fall back to dxlink_status.last_quote_ts.
+                        chain_status = snap.get("chain_status") or {}
+                        now_t = time.time()
+                        quote_ages = []
+                        for ul_data in chain_status.values():
+                            lqt = ul_data.get("last_quote_ts")
+                            if lqt:
+                                try:
+                                    from datetime import datetime as _dt
+                                    dt = _dt.fromisoformat(lqt.replace("Z", "+00:00"))
+                                    quote_ages.append(now_t - dt.timestamp())
+                                except Exception:
+                                    pass
+                        if not quote_ages:
+                            raw_lqt = dx.get("last_quote_ts") or ""
+                            if raw_lqt:
+                                try:
+                                    from datetime import datetime as _dt
+                                    dt = _dt.fromisoformat(raw_lqt.replace("Z", "+00:00"))
+                                    quote_ages.append(now_t - dt.timestamp())
+                                except Exception:
+                                    pass
+                        if quote_ages:
+                            best_age = min(quote_ages)
+                            dx_fresh_color = (GREEN if best_age < 60
+                                              else YELLOW if best_age < 300 else RED)
+                            dx_fresh_str = f"{_fmt_age(best_age)} ago"
+                        else:
+                            dx_fresh_color = TEXT_SECONDARY
+                            dx_fresh_str = "—"
                         _sta_dxlink_label.set_text(
-                            f"Symbols:   {dx.get('symbols_subscribed', '—')}\n"
-                            f"Last quote: {(dx.get('last_quote_ts') or '')[:19]}"
+                            f"Symbols:    {dx.get('symbols_subscribed', '—')}\n"
+                            f"Last quote: {dx_fresh_str}"
+                        )
+                        _sta_dxlink_label.style(
+                            replace=f"color: {dx_fresh_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
                         )
                         pid = snap.get("schedule_engine_pid")
                         pid_color = GREEN if pid else RED
@@ -3266,15 +3516,16 @@ class Dashboard:
                         err_rows = []
                         for i, e in enumerate(errs[:20]):
                             if isinstance(e, str):
-                                err_rows.append({"ts": str(i), "message": e, "context": ""})
+                                err_rows.append({"ts": str(i), "message": e, "record_id": ""})
                             else:
+                                ts_raw = e.get("timestamp") or e.get("ts") or str(i)
                                 err_rows.append({
-                                    "ts":      (e.get("ts") or str(i))[:19],
-                                    "message": e.get("message") or e.get("error") or str(e),
-                                    "context": e.get("context") or e.get("spec_id") or "",
+                                    "ts":        ts_raw[:19] if isinstance(ts_raw, str) else str(ts_raw),
+                                    "message":   e.get("message") or e.get("error") or str(e),
+                                    "record_id": e.get("record_id") or e.get("spec_id") or "",
                                 })
                         if not err_rows:
-                            err_rows = [{"ts": "—", "message": "no errors", "context": ""}]
+                            err_rows = [{"ts": "—", "message": "no errors", "record_id": ""}]
                         sta_errors_table.rows = err_rows
                         sta_errors_table.update()
 
@@ -4563,10 +4814,13 @@ class Dashboard:
                 last_state = history[-1].get("state") if history else None
                 if new_state != last_state:
                     history.append({
-                        "ts": msg.get("ts", ""),
-                        "state": new_state,
-                        "record_id": rid,
-                        "spec_id": rec.get("spec_id", ""),
+                        "ts":         msg.get("ts", ""),
+                        "state":      new_state,
+                        "record_id":  rid,
+                        "spec_id":    rec.get("spec_id", ""),
+                        # Preserve gate_trace snapshot for GATE_PENDING audit
+                        "gate_trace": rec.get("gate_trace") if new_state == "GATE_PENDING" else None,
+                        "last_reason": rec.get("last_reason", ""),
                     })
 
     def _process_message(self, msg: dict):
