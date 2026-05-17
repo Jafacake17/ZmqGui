@@ -265,6 +265,21 @@ def _short_cond_label(full: str) -> str:
     return full
 
 
+def _coerce_float(v) -> float | None:
+    """Convert STA's Decimal-as-JSON-string values to float.
+
+    STA serialises Decimal fields as strings ("0.0", "1.45") for
+    precision-preserving JSON. ZmqGui is the conversion boundary;
+    None passes through so callers can distinguish "no data" from zero.
+    """
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _fmt_countdown(seconds) -> str:
     """Format a seconds-until-event as a compact countdown: "2d 3h", "4h 12m", "8m 30s"."""
     if seconds is None:
@@ -3032,16 +3047,17 @@ class Dashboard:
                         for rec in (snap.get("lifecycle") or []):
                             rid   = rec.get("record_id") or rec.get("spec_id") or "?"
                             state = rec.get("state", "?")
-                            pnl   = rec.get("current_pnl_bps")
+                            pnl   = _coerce_float(rec.get("current_pnl_bps"))
                             pnl_s = (f"+{pnl:.1f}" if pnl is not None and pnl >= 0
                                      else f"{pnl:.1f}" if pnl is not None else "—")
-                            upnl      = rec.get("unrealised_pnl")
-                            upnl_s    = (f"+{upnl:.2f}" if upnl is not None and upnl >= 0
-                                         else f"{upnl:.2f}" if upnl is not None else "—")
-                            ecredit   = rec.get("entry_credit")
+                            # Decimal-as-string coercion at renderer boundary
+                            upnl   = _coerce_float(rec.get("unrealised_pnl"))
+                            upnl_s = (f"+{upnl:.2f}" if upnl is not None and upnl >= 0
+                                      else f"{upnl:.2f}" if upnl is not None else "—")
+                            ecredit   = _coerce_float(rec.get("entry_credit"))
                             ecredit_s = (f"+{ecredit:.2f}" if ecredit is not None and ecredit >= 0
                                          else f"{ecredit:.2f}" if ecredit is not None else "—")
-                            mark   = rec.get("current_mark")
+                            mark   = _coerce_float(rec.get("current_mark"))
                             mark_s = f"{mark:.2f}" if mark is not None else "—"
                             sched  = rec.get("scheduled_entry") or ""
                             try:
@@ -3252,20 +3268,22 @@ class Dashboard:
                         if snap is None:
                             return
                         _sta_chain_snap_cache[0] = snap
-                        # Prefer enriched chain_status; fall back to chain_stats
+                        # Prefer enriched chain_status (has per_underlying dict);
+                        # fall back to legacy chain_stats summary format.
                         chain_status = snap.get("chain_status") or {}
                         chain_stats  = snap.get("chain_stats") or {}
-                        source = chain_status if chain_status else chain_stats
+                        per_underlying = chain_status.get("per_underlying") or {}
+                        source = per_underlying if per_underlying else chain_stats
                         rows = []
                         for underlying, stats in sorted(source.items()):
-                            # Enriched path (chain_status)
-                            if chain_status:
+                            # Enriched path (chain_status.per_underlying)
+                            if per_underlying:
                                 loaded  = stats.get("strikes_loaded")
                                 greek   = stats.get("strikes_with_greeks")
                                 pct_raw = (greek / loaded * 100.0
                                            if loaded and greek is not None else -1.0)
                                 pct_s   = f"{pct_raw:.0f}%" if pct_raw >= 0 else "—"
-                                spot    = stats.get("spot_estimate")
+                                spot    = _coerce_float(stats.get("spot_estimate"))
                                 lqt     = stats.get("last_quote_ts") or ""
                                 lgt     = stats.get("last_greeks_ts") or ""
                             else:
@@ -3358,7 +3376,8 @@ class Dashboard:
                             if known and _sta_lc_selected[0] is None:
                                 _sta_lc_selected[0] = known[0]
                                 _sta_lc_select.value = known[0]
-                        sel = _sta_lc_selected[0] or (_sta_lc_select.value if _sta_lc_select.value else None)
+                        raw_sel = _sta_lc_selected[0] or (_sta_lc_select.value if _sta_lc_select.value else None)
+                        sel = str(raw_sel) if raw_sel is not None else None
                         if not sel or sel not in history:
                             _sta_lc_status.set_text(
                                 "Waiting for STA lifecycle data…" if not known
@@ -3393,7 +3412,8 @@ class Dashboard:
                         lifecycle_table.update()
 
                     _sta_lc_select.on("update:model-value",
-                                      lambda e: (_sta_lc_selected.__setitem__(0, e.value),
+                                      lambda e: (_sta_lc_selected.__setitem__(
+                                          0, str(e.value) if e.value is not None else None),
                                                  update_sta_lifecycle()))
                     ui.timer(2.0, update_sta_lifecycle)
 
@@ -3466,12 +3486,13 @@ class Dashboard:
                             replace=f"color: {age_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
                         )
                         dx = snap.get("dxlink_status") or {}
-                        # DXLink freshness: prefer chain_status per-underlying timestamps
-                        # (enriched), fall back to dxlink_status.last_quote_ts.
+                        # DXLink freshness: prefer chain_status.per_underlying timestamps
+                        # (enriched schema), fall back to dxlink_status.last_quote_ts.
                         chain_status = snap.get("chain_status") or {}
+                        per_ul = chain_status.get("per_underlying") or {}
                         now_t = time.time()
                         quote_ages = []
-                        for ul_data in chain_status.values():
+                        for ul_data in per_ul.values():
                             lqt = ul_data.get("last_quote_ts")
                             if lqt:
                                 try:
@@ -4808,7 +4829,10 @@ class Dashboard:
             self._sta_latest = msg
             self._sta_last_ts = time.time()
             for rec in (msg.get("lifecycle") or []):
-                rid = rec.get("record_id") or rec.get("spec_id") or "?"
+                # Stringify record_id so history keys are consistent strings
+                # regardless of whether STA emits int or str for this field.
+                rid_raw = rec.get("record_id")
+                rid = str(rid_raw) if rid_raw is not None else (rec.get("spec_id") or "?")
                 history = self._sta_lifecycle_history.setdefault(rid, [])
                 new_state = rec.get("state", "?")
                 last_state = history[-1].get("state") if history else None

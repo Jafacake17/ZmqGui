@@ -1,0 +1,300 @@
+{
+  "ts": "2026-05-17T21:45:28.742610+00:00",
+  "lifecycle": [
+    {
+      "record_id": 1,
+      "spec_id": "a1_nvda_bull_put_2026_05_29",
+      "state": "AUTHORED",
+      "parent_id": null,
+      "scheduled_entry": "2026-05-19T16:00:00-04:00",
+      "leg_count": 2,
+      "source_path": "/home/jacob/StructuredTradeApp/slates/active/a1-nvda-bull-put-2026-05-29.yaml",
+      "last_reason": "created",
+      "time_to_time_stop_seconds": 1030471,
+      "time_to_expiry_seconds": 1030471
+    },
+    {
+      "record_id": 2,
+      "spec_id": "a3_retail_earnings_basket_2026_05_22",
+      "state": "GATE_PENDING",
+      "parent_id": null,
+      "scheduled_entry": "2026-05-15T16:00:00-04:00",
+      "leg_count": 0,
+      "source_path": "/home/jacob/StructuredTradeApp/slates/active/a3-retail-earnings-basket-2026-05-22.yaml",
+      "last_reason": "schedule@2026-05-17T19:50:24.486635+00:00",
+      "gate_trace": [
+        {
+          "gate_id": "G4a_vix_below_22",
+          "indicator": "vix_index",
+          "op": "<",
+          "threshold": 22.0,
+          "action": "HALVE",
+          "observed": null,
+          "passed": null,
+          "blocker_reason": null
+        },
+        {
+          "gate_id": "G4b_xrt_breadth_ok",
+          "indicator": "xrt_breadth_pct",
+          "op": ">=",
+          "threshold": 0.4,
+          "action": "HALVE",
+          "observed": null,
+          "passed": null,
+          "blocker_reason": null
+        }
+      ],
+      "time_to_time_stop_seconds": 425671,
+      "time_to_expiry_seconds": null
+    },
+    {
+      "record_id": 3,
+      "spec_id": "a3a_tgt_bull_put_credit_spread",
+      "state": "AUTHORED",
+      "parent_id": 2,
+      "scheduled_entry": "2026-05-19T16:00:00-04:00",
+      "leg_count": 2,
+      "source_path": null,
+      "last_reason": "created",
+      "time_to_time_stop_seconds": 425671,
+      "time_to_expiry_seconds": 425671
+    },
+    {
+      "record_id": 4,
+      "spec_id": "a3b_low_bull_put_credit_spread",
+      "state": "AUTHORED",
+      "parent_id": 2,
+      "scheduled_entry": "2026-05-19T16:00:00-04:00",
+      "leg_count": 2,
+      "source_path": null,
+      "last_reason": "created",
+      "time_to_time_stop_seconds": 425671,
+      "time_to_expiry_seconds": 425671
+    },
+    {
+      "record_id": 5,
+      "spec_id": "a3c_hd_bull_put_credit_spread",
+      "state": "GATE_PENDING",
+      "parent_id": 2,
+      "scheduled_entry": "2026-05-15T16:00:00-04:00",
+      "leg_count": 2,
+      "source_path": null,
+      "last_reason": "schedule@2026-05-17T19:50:24.486635+00:00",
+      "gate_trace": [
+        {
+          "gate_id": "hd_G1_rv_pct_rank",
+          "indicator": "trailing_rv_20d_pct_rank_252d_sector_cross_sectional",
+          "op": ">=",
+          "threshold": 0.75,
+          "action": "HARD_VETO",
+          "observed": null,
+          "passed": false,
+          "blocker_reason": "indicator not registered: implied_vol_25d_over_forward_iv_proxy, trailing_rv_20d_pct_rank_252d_sector_cross_sectional"
+        },
+        {
+          "gate_id": "hd_G2_iv_over_forward_iv_proxy",
+          "indicator": "implied_vol_25d_over_forward_iv_proxy",
+          "op": ">=",
+          "threshold": 1.2,
+          "action": "HARD_VETO",
+          "observed": null,
+          "passed": false,
+          "blocker_reason": "indicator not registered: implied_vol_25d_over_forward_iv_proxy, trailing_rv_20d_pct_rank_252d_sector_cross_sectional"
+        }
+      ],
+      "time_to_time_stop_seconds": 425671,
+      "time_to_expiry_seconds": 425671
+    },
+    {
+      "record_id": 6,
+      "spec_id": "a3d_tjx_bull_put_credit_spread",
+      "state": "AUTHORED",
+      "parent_id": 2,
+      "scheduled_entry": "2026-05-19T16:00:00-04:00",
+      "leg_count": 2,
+      "source_path": null,
+      "last_reason": "created",
+      "time_to_time_stop_seconds": 425671,
+      "time_to_expiry_seconds": 425671
+    },
+    {
+      "record_id": 8,
+      "spec_id": "smoke_test_nvda_absolute_strikes_2026_05_22",
+      "state": "ACTIVE",
+      "parent_id": null,
+      "scheduled_entry": "2026-05-17T20:28:21+00:00",
+      "leg_count": 2,
+      "source_path": "/home/jacob/StructuredTradeApp/slates/active/smoke-test-nvda-absolute-strikes.yaml",
+      "last_reason": "paper fill synthesised (fill_id=paper-aa29b0465ebc)",
+      "legs": [
+        {
+          "leg_id": "short_put_222_5",
+          "side": "SELL",
+          "qty": 1,
+          "contract": {
+            "underlying": "NVDA",
+            "expiry": "2026-05-22",
+            "strike": "222.5",
+            "right": "P",
+            "settlement": "PM",
+            "multiplier": 100
+          },
+          "entry_price": "0.0",
+          "current_bid": "0.0",
+          "current_ask": "0.0",
+          "current_delta": null,
+          "current_iv": null
+        },
+        {
+          "leg_id": "long_put_215",
+          "side": "BUY",
+          "qty": 1,
+          "contract": {
+            "underlying": "NVDA",
+            "expiry": "2026-05-22",
+            "strike": "215.0",
+            "right": "P",
+            "settlement": "PM",
+            "multiplier": 100
+          },
+          "entry_price": "0.0",
+          "current_bid": "0.0",
+          "current_ask": "0.0",
+          "current_delta": null,
+          "current_iv": null
+        }
+      ],
+      "entry_credit": "0.0",
+      "current_mark": null,
+      "unrealised_pnl": null,
+      "time_to_time_stop_seconds": 2572,
+      "time_to_expiry_seconds": 425671
+    }
+  ],
+  "fills_recent": [
+    {
+      "fill_id": "paper-aa29b0465ebc",
+      "combo_id": "smoke_test_nvda_absolute_strikes_2026_05_22@1779049701",
+      "record_id": 8,
+      "ts": "2026-05-17T20:28:28.029355+00:00",
+      "fill_kind": "paper",
+      "leg_count": 2
+    }
+  ],
+  "chain_status": {
+    "underlyings": [
+      "nvda"
+    ],
+    "last_chain_ts": "2026-05-17T20:27:34.366435",
+    "table_count": 1,
+    "per_underlying": {
+      "nvda": {
+        "strikes_loaded": 578,
+        "strikes_with_greeks": 15,
+        "last_quote_ts": "2026-05-17T20:27:34.366435",
+        "last_greeks_ts": "2026-05-17T20:27:34.366435",
+        "expiries": [
+          {
+            "expiry": "2026-05-18",
+            "strikes": 58
+          },
+          {
+            "expiry": "2026-05-22",
+            "strikes": 97
+          },
+          {
+            "expiry": "2026-05-26",
+            "strikes": 62
+          },
+          {
+            "expiry": "2026-05-27",
+            "strikes": 65
+          },
+          {
+            "expiry": "2026-05-29",
+            "strikes": 103
+          },
+          {
+            "expiry": "2026-06-01",
+            "strikes": 29
+          },
+          {
+            "expiry": "2026-06-05",
+            "strikes": 82
+          },
+          {
+            "expiry": "2026-06-12",
+            "strikes": 72
+          },
+          {
+            "expiry": "2026-06-18",
+            "strikes": 246
+          },
+          {
+            "expiry": "2026-06-26",
+            "strikes": 72
+          },
+          {
+            "expiry": "2026-07-17",
+            "strikes": 97
+          },
+          {
+            "expiry": "2026-08-21",
+            "strikes": 77
+          },
+          {
+            "expiry": "2026-09-18",
+            "strikes": 77
+          },
+          {
+            "expiry": "2026-10-16",
+            "strikes": 77
+          },
+          {
+            "expiry": "2026-11-20",
+            "strikes": 68
+          },
+          {
+            "expiry": "2026-12-18",
+            "strikes": 247
+          },
+          {
+            "expiry": "2027-01-15",
+            "strikes": 77
+          },
+          {
+            "expiry": "2027-03-19",
+            "strikes": 73
+          },
+          {
+            "expiry": "2027-06-17",
+            "strikes": 77
+          },
+          {
+            "expiry": "2027-09-17",
+            "strikes": 67
+          },
+          {
+            "expiry": "2027-12-17",
+            "strikes": 76
+          },
+          {
+            "expiry": "2028-01-21",
+            "strikes": 77
+          },
+          {
+            "expiry": "2028-06-16",
+            "strikes": 80
+          },
+          {
+            "expiry": "2028-12-15",
+            "strikes": 75
+          }
+        ]
+      }
+    }
+  },
+  "schedule_engine_pid": 2425811,
+  "version": "427f6c8",
+  "errors_recent": []
+}
