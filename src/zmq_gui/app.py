@@ -3245,7 +3245,7 @@ class Dashboard:
                             expiry_table.update()
                             return
                         cs    = snap.get("chain_status") or {}
-                        stats = cs.get(sel) or {}
+                        stats = cs.get("per_underlying", {}).get(sel) or {}
                         exps  = stats.get("expiries") or []
                         rows  = []
                         for ex in sorted(exps, key=lambda x: x.get("expiry", "")):
@@ -3518,8 +3518,15 @@ class Dashboard:
                         else:
                             dx_fresh_color = TEXT_SECONDARY
                             dx_fresh_str = "—"
+                        # symbols_subscribed: prefer dxlink_status field,
+                        # fall back to chain_status.table_count (real heartbeat
+                        # has no dxlink_status key — count comes from chain_status)
+                        syms_count = (dx.get("symbols_subscribed")
+                                      or chain_status.get("table_count")
+                                      or len(per_ul)
+                                      or "—")
                         _sta_dxlink_label.set_text(
-                            f"Symbols:    {dx.get('symbols_subscribed', '—')}\n"
+                            f"Symbols:    {syms_count}\n"
                             f"Last quote: {dx_fresh_str}"
                         )
                         _sta_dxlink_label.style(

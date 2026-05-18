@@ -242,45 +242,60 @@ def test_trade_rows_no_crash_on_decimal_strings():
     rows = render_trade_rows(snap)
     assert len(rows) > 0
 
-def test_active_row_entry_credit_is_formatted():
+def test_authored_row_entry_credit_dash():
+    """AUTHORED records have no entry_credit (None) → renders '—'."""
     snap = load_fixture()
     rows = render_trade_rows(snap)
-    active = next((r for r in rows if r["state"] == "ACTIVE"), None)
-    assert active is not None
-    # entry_credit="0.0" → "+0.00"
-    assert active["entry_credit"] == "+0.00"
+    authored = next((r for r in rows if r["state"] == "AUTHORED"), None)
+    assert authored is not None
+    assert authored["entry_credit"] == "—"
+    assert authored["mark"] == "—"
+    assert authored["pnl_usd"] == "—"
+    assert authored["pnl_usd_raw"] == 0.0
 
-def test_active_row_mark_is_dash_when_null():
-    snap = load_fixture()
+def test_active_entry_credit_decimal_string_coercion():
+    """Synthetic ACTIVE record with entry_credit='0.0' (Decimal-as-string) renders '+0.00'."""
+    snap = {
+        "lifecycle": [{
+            "record_id": 99, "spec_id": "synthetic_active", "state": "ACTIVE",
+            "scheduled_entry": "2026-05-17T08:00:00Z",
+            "legs": [
+                {"side": "SELL", "qty": 1,
+                 "contract": {"underlying": "NVDA", "expiry": "2026-05-22",
+                              "strike": "222.5", "right": "P"}},
+                {"side": "BUY", "qty": 1,
+                 "contract": {"underlying": "NVDA", "expiry": "2026-05-22",
+                              "strike": "215.0", "right": "P"}},
+            ],
+            "entry_credit": "0.0",
+            "current_mark": None,
+            "unrealised_pnl": None,
+            "time_to_time_stop_seconds": 3232,
+            "time_to_expiry_seconds": 426331,
+        }]
+    }
     rows = render_trade_rows(snap)
-    active = next((r for r in rows if r["state"] == "ACTIVE"), None)
-    assert active["mark"] == "—"
+    row = rows[0]
+    assert row["entry_credit"] == "+0.00", f"expected '+0.00', got {row['entry_credit']!r}"
+    assert row["mark"] == "—"
+    assert row["pnl_usd"] == "—"
+    assert row["countdown"] != "—"
+    assert "m" in row["countdown"] or "s" in row["countdown"]
+    assert "SHORT" in row["legs"] and "LONG" in row["legs"]
 
-def test_active_row_pnl_usd_dash_when_null():
-    snap = load_fixture()
+def test_active_entry_credit_positive():
+    """Synthetic ACTIVE record with entry_credit='1.45' renders '+1.45'."""
+    snap = {"lifecycle": [{"record_id": 98, "spec_id": "s", "state": "ACTIVE",
+                           "entry_credit": "1.45", "current_mark": "1.20",
+                           "unrealised_pnl": "-25.00",
+                           "time_to_time_stop_seconds": None,
+                           "time_to_expiry_seconds": 86400}]}
     rows = render_trade_rows(snap)
-    active = next((r for r in rows if r["state"] == "ACTIVE"), None)
-    assert active["pnl_usd"] == "—"
-    assert active["pnl_usd_raw"] == 0.0
-
-def test_active_row_countdown_from_time_stop():
-    """time_to_time_stop_seconds=3232 < time_to_expiry_seconds=426331 → use stop."""
-    snap = load_fixture()
-    rows = render_trade_rows(snap)
-    active = next((r for r in rows if r["state"] == "ACTIVE"), None)
-    # min(3232, 426331) = 3232 → 53m 52s
-    assert active["countdown"] != "—"
-    assert "m" in active["countdown"]
-
-def test_active_row_legs_condensed():
-    snap = load_fixture()
-    rows = render_trade_rows(snap)
-    active = next((r for r in rows if r["state"] == "ACTIVE"), None)
-    legs_str = active["legs"]
-    assert "SHORT" in legs_str
-    assert "LONG" in legs_str
-    assert "NVDA" in legs_str
-    assert "222.5P" in legs_str
+    row = rows[0]
+    assert row["entry_credit"] == "+1.45"
+    assert row["mark"] == "1.20"
+    assert row["pnl_usd"] == "-25.00"
+    assert row["pnl_usd_raw"] == -25.0
 
 def test_gate_pending_chips_rendered():
     """Real gate_trace has observed=null → passed=null → all YELLOW (unknown).
@@ -291,7 +306,7 @@ def test_gate_pending_chips_rendered():
     assert gp is not None
     chips = gp["gate_chips"]
     assert len(chips) > 0
-    # All are YELLOW (unknown) because observed=null → passed=null
+    # null observed → passed=null → YELLOW; or HARD_VETO passed=false → RED
     for chip in chips:
         assert chip["color"] in (YELLOW, RED), f"Unexpected color: {chip['color']}"
 
@@ -299,27 +314,26 @@ def test_gate_pending_chips_with_blocker_reason():
     """Gate chips that have a blocker_reason include it in the label."""
     snap = load_fixture()
     rows = render_trade_rows(snap)
-    # record 5 has HARD_VETO gates with blocker_reason
     gp5 = next((r for r in rows if r["record_id"] == "5"), None)
     if gp5 is not None:
         chips_with_blocker = [c for c in gp5["gate_chips"] if "indicator not registered" in c["label"]]
         assert len(chips_with_blocker) > 0
 
 def test_authored_row_no_gate_chips():
-    """AUTHORED rows have no gate_chips (gate only applies to GATE_PENDING)."""
+    """AUTHORED rows have no gate_chips."""
     snap = load_fixture()
     rows = render_trade_rows(snap)
     authored = next((r for r in rows if r["state"] == "AUTHORED"), None)
     assert authored is not None
     assert authored["gate_chips"] == []
 
-def test_active_row_pnl_bps_null_renders_dash():
-    """ACTIVE row with current_pnl_bps=null renders '—'."""
+def test_authored_row_pnl_bps_null_renders_dash():
+    """AUTHORED row with current_pnl_bps absent renders '—'."""
     snap = load_fixture()
     rows = render_trade_rows(snap)
-    active = next((r for r in rows if r["state"] == "ACTIVE"), None)
-    assert active is not None
-    assert active["pnl_bps"] == "—"
+    authored = next((r for r in rows if r["state"] == "AUTHORED"), None)
+    assert authored is not None
+    assert authored["pnl_bps"] == "—"
 
 
 # Bug2 — chain_status.per_underlying iteration
@@ -409,11 +423,12 @@ def test_lifecycle_history_keys_are_strings():
     for key in d._sta_lifecycle_history.keys():
         assert isinstance(key, str), f"Expected str key, got {type(key)}: {key!r}"
 
-def test_lifecycle_history_record_8_present():
+def test_lifecycle_history_record_1_present():
+    """Real fixture has record_id=1 (AUTHORED). History key must be str '1'."""
     d = Dashboard(GuiCfg())
     d._on_sta_heartbeat(load_fixture())
-    assert "8" in d._sta_lifecycle_history
-    assert d._sta_lifecycle_history["8"][0]["state"] == "ACTIVE"
+    assert "1" in d._sta_lifecycle_history
+    assert d._sta_lifecycle_history["1"][0]["state"] == "AUTHORED"
 
 def test_lifecycle_gate_trace_stored_for_gate_pending():
     """Real fixture: record_id=2 and record_id=5 are GATE_PENDING with gate_trace."""
