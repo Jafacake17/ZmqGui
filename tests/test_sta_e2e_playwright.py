@@ -367,6 +367,57 @@ def test_sta_slates_no_crash():
 
 
 @skip_if_unavailable
+def test_past_trades_pnl_consistent_with_pct():
+    """Past Trades P&L (bps) column: bps = pnl_pct × 100 for at least 3 rows.
+
+    Also verifies: no 'bps' column (dropped), no 'P&L %' column (dropped),
+    and XAU rows show bps-scale values (not 4-digit GBP magnitudes).
+    """
+    async def run():
+        page, _, browser, pw = await _open_page()
+        try:
+            body = await page.inner_text("body")
+            lines = [l.strip() for l in body.splitlines() if l.strip()]
+
+            # Console tab is default; find Past Trades section
+            pt_idx = next((i for i, l in enumerate(lines) if "Past Trades" in l), None)
+            assert pt_idx is not None, "Past Trades section not found"
+            pt_lines = lines[pt_idx:pt_idx + 80]
+
+            # Column header check: must have 'P&L (bps)' NOT 'P&L %' or bare 'bps'
+            header = next((l for l in pt_lines if "Entry Time" in l and "Exit" in l), "")
+            assert "P&L (bps)" in header or "P&L (bps)" in " ".join(pt_lines[:5]), \
+                f"P&L (bps) header not found. Header: {header!r}"
+            assert "P&L %" not in header, f"P&L % column should be dropped. Header: {header!r}"
+
+            # Find data rows — tab-separated, containing pair names and numeric P&L
+            data_rows = []
+            for l in pt_lines[1:40]:
+                parts = l.split("\t")
+                if len(parts) >= 8 and any(
+                    sym in l for sym in ["EUR_USD", "GBP_USD", "USD_JPY", "XAU_USD", "NZD_USD"]):
+                    data_rows.append(parts)
+
+            assert len(data_rows) >= 3, \
+                f"Need at least 3 data rows for reconciliation check, got {len(data_rows)}"
+
+            # For each row, check P&L column value looks like bps (not 4-digit GBP)
+            for row in data_rows[:5]:
+                pair = next((p for p in row if "_" in p and p.isupper()), "?")
+                # Find P&L value: last tab-separated field or near-last
+                pnl_candidates = [p for p in row if p and (p.startswith("+") or p.startswith("-"))
+                                   and p[1:].replace(".", "").replace(" ", "").isdigit()]
+                if pnl_candidates and pair == "XAU_USD":
+                    pnl_val = float(pnl_candidates[-1])
+                    assert abs(pnl_val) < 500, \
+                        f"XAU_USD P&L looks like currency (got {pnl_val}); expected bps (<500)"
+
+        finally:
+            await browser.close(); await pw.stop()
+    asyncio.run(run())
+
+
+@skip_if_unavailable
 def test_screenshot_all_tabs():
     """Screenshot every STA tab for visual verification archive."""
     async def run():

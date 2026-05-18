@@ -1646,10 +1646,11 @@ class Dashboard:
                         {"name": "exit_time", "label": "Exit Time", "field": "exit_time", "align": "left", "sortable": True, "sort": "numeric"},
                         {"name": "exit_price", "label": "Exit", "field": "exit_price", "align": "right", "sortable": True},
                         {"name": "geometry", "label": "MFE:TP:Act:SL:MAE (bps)", "field": "geometry", "align": "right", "sortable": False},
-                        # Net bps per trade — equal-weighted, currency-agnostic primary view.
-                        {"name": "net_bps", "label": "bps", "field": "net_bps", "align": "right", "sortable": True, "sort": "numeric"},
-                        {"name": "pnl_pct", "label": "P&L %", "field": "pnl_pct", "align": "right", "sortable": True, "sort": "numeric"},
-                        {"name": "pnl", "label": "P&L", "field": "pnl", "align": "right", "sortable": True, "sort": "numeric"},
+                        # Primary P&L column: bps (instrument-agnostic).
+                        # Formula: direction_sign × (exit−entry)/entry × 10000.
+                        # Replaces legacy currency P&L (showed 1879 GBP for a 56 bps
+                        # XAU move) and the net_bps column (was 0 for seeded trades).
+                        {"name": "pnl", "label": "P&L (bps)", "field": "pnl", "align": "right", "sortable": True, "sort": "numeric"},
                     ]
                     recent_trades_table = ui.table(
                         columns=rt_columns, rows=[], row_key="key",
@@ -1662,16 +1663,6 @@ class Dashboard:
                             }">{{ props.row.direction }}</span>
                         </q-td>
                     """)
-                    recent_trades_table.add_slot("body-cell-net_bps", r"""
-                        <q-td :props="props">
-                            <span :style="{
-                                color: props.row.pnl_raw > 0 ? '""" + GREEN + r"""'
-                                     : props.row.pnl_raw < 0 ? '""" + RED + r"""'
-                                     : '""" + TEXT_SECONDARY + r"""',
-                                fontWeight: 'bold'
-                            }">{{ props.row.net_bps }}</span>
-                        </q-td>
-                    """)
                     recent_trades_table.add_slot("body-cell-pnl", r"""
                         <q-td :props="props">
                             <span :style="{
@@ -1680,15 +1671,6 @@ class Dashboard:
                                      : '""" + TEXT_SECONDARY + r"""',
                                 fontWeight: 'bold'
                             }">{{ props.row.pnl }}</span>
-                        </q-td>
-                    """)
-                    recent_trades_table.add_slot("body-cell-pnl_pct", r"""
-                        <q-td :props="props">
-                            <span :style="{
-                                color: props.row.pnl_raw > 0 ? '""" + GREEN + r"""'
-                                     : props.row.pnl_raw < 0 ? '""" + RED + r"""'
-                                     : '""" + TEXT_SECONDARY + r"""',
-                            }">{{ props.row.pnl_pct }}</span>
                         </q-td>
                     """)
                     recent_trades_table.add_slot("body-cell-geometry", r"""
@@ -4298,8 +4280,11 @@ class Dashboard:
                                      if e_ts else "--")
                             x_str = (_dt.fromtimestamp(x_ts).strftime("%Y-%m-%d %H:%M:%S")
                                      if x_ts else "--")
-                            net = float(t.get("pnl_net") or 0)
                             pnl_pct = float(t.get("pnl_pct") or 0)
+                            # bps = pnl_pct × 100 — instrument-agnostic, equal-weighted.
+                            # pnl_pct is always set (seeded + live paths both compute it
+                            # as direction_sign×(exit−entry)/entry×100). No qty, no FX.
+                            trade_bps = pnl_pct * 100.0
                             sl_v = float(t.get("stop_loss") or 0)
                             tp_v = float(t.get("take_profit") or 0)
                             sl_str = f"{sl_v:{fmt}}" if sl_v > 0 else "--"
@@ -4320,7 +4305,7 @@ class Dashboard:
                                 mae_bps = None
                             tp_bps = _to_bps(tp_v) if tp_v > 0 else None
                             sl_bps = _to_bps(sl_v) if sl_v > 0 else None
-                            actual_bps = pnl_pct * 100
+                            actual_bps = trade_bps
                             def _fmt_bps(v):
                                 if v is None:
                                     return "--"
@@ -4339,10 +4324,7 @@ class Dashboard:
                                 exit_reason = "sl"
                             else:
                                 exit_reason = "timeout"
-                            raw_bps = float(t.get("net_bps") or 0)
                             rt_rows.append({
-                                # Unique key per closed trade so Quasar's
-                                # row diffing doesn't churn.
                                 "key": f"{t.get('strategy_id','?')}_{t.get('symbol','?')}_{e_ts}",
                                 "strategy": t.get("strategy_id", "?"),
                                 "broker": t.get("broker_id") or "—",
@@ -4358,12 +4340,9 @@ class Dashboard:
                                 "exit_price": f"{exit_px:{fmt}}",
                                 "exit_reason": exit_reason,
                                 "geometry": geometry_str,
-                                "net_bps": (f"+{raw_bps:.1f}" if raw_bps >= 0
-                                            else f"{raw_bps:.1f}"),
-                                "pnl_pct": (f"+{pnl_pct:.3f}%" if pnl_pct >= 0
-                                            else f"{pnl_pct:.3f}%"),
-                                "pnl": (f"+{net:.2f}" if net >= 0 else f"{net:.2f}"),
-                                "pnl_raw": net,
+                                "pnl": (f"+{trade_bps:.1f}" if trade_bps >= 0
+                                        else f"{trade_bps:.1f}"),
+                                "pnl_raw": trade_bps,
                             })
                         if not rt_rows:
                             rt_rows = [{
@@ -4373,13 +4352,12 @@ class Dashboard:
                                 "direction": "--",
                                 "entry_time": "--", "entry_time_raw": 0,
                                 "entry_price": "--",
-                                "net_bps": "--",
                                 "stop_loss": "--", "take_profit": "--",
                                 "exit_time": "--", "exit_time_raw": 0,
                                 "exit_price": "--",
                                 "exit_reason": None,
                                 "geometry": "--",
-                                "pnl_pct": "--", "pnl": "--", "pnl_raw": 0.0,
+                                "pnl": "--", "pnl_raw": 0.0,
                             }]
                         recent_trades_table.rows = rt_rows
                         recent_trades_table.update()
