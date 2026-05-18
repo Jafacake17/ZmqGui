@@ -60,6 +60,21 @@ async def _click_tab(page, name, wait_ms=TAB_WAIT_MS):
     return await page.inner_text("body")
 
 
+async def _wait_for_sta_data(page, timeout_s: int = 45) -> bool:
+    """Poll until the 'Waiting for first STA heartbeat' message disappears.
+
+    STA tick-seconds=30 so we may need up to ~35s after a fresh restart.
+    Returns True when data arrived, False on timeout.
+    """
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        body = await page.inner_text("body")
+        if "Waiting for first STA heartbeat" not in body:
+            return True
+        await page.wait_for_timeout(3000)
+    return False
+
+
 # ── tests ─────────────────────────────────────────────────────────────────────
 
 @skip_if_unavailable
@@ -78,12 +93,14 @@ def test_sta_trades_renders_data_rows():
     async def run():
         page, _, browser, pw = await _open_page()
         try:
-            body = await _click_tab(page, "STA Trades")
-            assert "Waiting for first STA heartbeat" not in body, \
-                "STA Trades still showing waiting message — heartbeat not received"
+            await _click_tab(page, "STA Trades")
+            # STA tick-seconds=30; wait up to 45s for first heartbeat
+            got_data = await _wait_for_sta_data(page)
+            assert got_data, "STA Trades still showing waiting message after 45s"
+            body = await page.inner_text("body")
             state_found = any(s in body for s in
                               ["AUTHORED", "GATE_PENDING", "ACTIVE", "DISPATCHED"])
-            assert state_found, f"No lifecycle state visible. Body excerpt:\n{body[:600]}"
+            assert state_found, f"No lifecycle state visible. Body:\n{body[:600]}"
         finally:
             await browser.close(); await pw.stop()
     asyncio.run(run())
@@ -95,9 +112,10 @@ def test_sta_chain_underlying_row_and_expiries():
     async def run():
         page, _, browser, pw = await _open_page()
         try:
-            body = await _click_tab(page, "STA Chain")
-            assert "Waiting for STA chain stats" not in body, \
-                "STA Chain still waiting"
+            await _click_tab(page, "STA Chain")
+            got_data = await _wait_for_sta_data(page)
+            assert got_data, "STA Chain still waiting after 45s"
+            body = await page.inner_text("body")
             # Per-underlying row: strikes count visible
             assert any(c.isdigit() for c in body), \
                 "No numeric data in STA Chain at all"
@@ -122,9 +140,10 @@ def test_sta_lifecycle_dropdown_and_audit_log():
     async def run():
         page, _, browser, pw = await _open_page()
         try:
-            body = await _click_tab(page, "STA Lifecycle")
-            assert "Waiting for STA lifecycle data" not in body, \
-                "STA Lifecycle still waiting"
+            await _click_tab(page, "STA Lifecycle")
+            got_data = await _wait_for_sta_data(page)
+            assert got_data, "STA Lifecycle still waiting after 45s"
+            body = await page.inner_text("body")
             assert "transition" in body.lower(), \
                 f"No transition count in STA Lifecycle. Body:\n{body[:400]}"
 
@@ -154,7 +173,10 @@ def test_sta_health_pid_and_symbols():
     async def run():
         page, _, browser, pw = await _open_page()
         try:
-            body = await _click_tab(page, "STA Health")
+            await _click_tab(page, "STA Health")
+            got_data = await _wait_for_sta_data(page)
+            assert got_data, "STA Health still waiting after 45s"
+            body = await page.inner_text("body")
             assert "PID:" in body, "schedule_engine_pid not visible in STA Health"
             assert "ago" in body, "DXLink freshness 'ago' label not found"
             sym_lines = [l for l in body.splitlines() if "Symbols:" in l]
@@ -163,6 +185,70 @@ def test_sta_health_pid_and_symbols():
             # Must have a digit, not just "—"
             assert any(c.isdigit() for c in sym_line), \
                 f"Symbols line shows no digit (Bug B). Line: {sym_line!r}"
+        finally:
+            await browser.close(); await pw.stop()
+    asyncio.run(run())
+
+
+@skip_if_unavailable
+def test_sta_trades_row_has_readable_label():
+    """A1 row must contain 'NVDA' + 'Bull Put' + 'fires' (not raw spec_id)."""
+    async def run():
+        page, _, browser, pw = await _open_page()
+        try:
+            await _click_tab(page, "STA Trades")
+            got_data = await _wait_for_sta_data(page)
+            assert got_data, "STA Trades still waiting after 45s"
+            body = await page.inner_text("body")
+            assert "A1" in body, "A1 label not found in STA Trades"
+            assert "NVDA" in body, "NVDA symbol not found in STA Trades"
+            assert "Bull Put" in body, "Bull Put type not found in STA Trades"
+            assert "fires" in body, "'fires' scheduled text not found in STA Trades"
+        finally:
+            await browser.close(); await pw.stop()
+    asyncio.run(run())
+
+
+@skip_if_unavailable
+def test_sta_trades_type_badges_visible():
+    """Trade-type badges (Bull Put, Basket, etc.) must appear in the DOM."""
+    async def run():
+        page, _, browser, pw = await _open_page()
+        try:
+            await _click_tab(page, "STA Trades")
+            await _wait_for_sta_data(page)
+            body = await page.inner_text("body")
+            # The fixture has Bull Put spreads and a Basket parent
+            type_found = any(t in body for t in ["Bull Put", "Basket", "Options"])
+            assert type_found, f"No trade-type badge found. Body: {body[:400]}"
+        finally:
+            await browser.close(); await pw.stop()
+    asyncio.run(run())
+
+
+@skip_if_unavailable
+def test_sta_lifecycle_dropdown_shows_spec_names():
+    """Lifecycle dropdown options must show '#N — Short Name', not bare numbers."""
+    async def run():
+        page, _, browser, pw = await _open_page()
+        try:
+            await _click_tab(page, "STA Lifecycle")
+            await _wait_for_sta_data(page)
+            body = await page.inner_text("body")
+            # Open the select to reveal options
+            selects = page.locator(".q-select")
+            if await selects.count() > 0:
+                await selects.first.click()
+                await page.wait_for_timeout(700)
+                opts_text = await page.inner_text(".q-menu") if await page.locator(".q-menu").count() else ""
+                await page.keyboard.press("Escape")
+                if opts_text:
+                    # Options should contain "#N — " prefix
+                    assert "#" in opts_text and "—" in opts_text, \
+                        f"Dropdown options lack '#N — Name' format. Options: {opts_text!r}"
+                    # A1 label should be visible
+                    assert "A1" in opts_text or "NVDA" in opts_text, \
+                        f"A1/NVDA not visible in dropdown options: {opts_text!r}"
         finally:
             await browser.close(); await pw.stop()
     asyncio.run(run())

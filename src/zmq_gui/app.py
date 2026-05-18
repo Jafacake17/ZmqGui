@@ -339,6 +339,107 @@ def _build_gate_chips(gate_trace: list) -> list:
     return chips
 
 
+_TRADE_TYPE_SKIP = {"credit", "spread", "put", "call"}
+
+
+def _derive_label(spec_id: str) -> str:
+    """Derive a short readable label from spec_id.
+
+    'a1_nvda_bull_put_2026_05_29'        → 'A1 NVDA Bull Put 5/29'
+    'a3_retail_earnings_basket_2026_05_22' → 'A3 Retail Earnings 5/22'
+    'a3a_tgt_bull_put_credit_spread'      → 'A3a TGT Bull Put'
+    """
+    parts = (spec_id or "").split("_")
+    if not parts:
+        return spec_id or "?"
+
+    raw_prefix = parts[0]
+    # a1→A1, a3a→A3a, smoke→Smoke
+    if len(raw_prefix) >= 2 and raw_prefix[0].isalpha() and raw_prefix[1].isdigit():
+        prefix = raw_prefix[0].upper() + raw_prefix[1:]
+    else:
+        prefix = raw_prefix.capitalize()
+
+    # Find year (4-digit, ≥2020) to delimit name vs date
+    year_idx = None
+    for i, p in enumerate(parts[1:], 1):
+        if len(p) == 4 and p.isdigit() and int(p) >= 2020:
+            year_idx = i
+            break
+
+    middle = parts[1:year_idx] if year_idx else parts[1:]
+    date_str = ""
+    if year_idx and len(parts) > year_idx + 2:
+        try:
+            date_str = f"{int(parts[year_idx + 1])}/{int(parts[year_idx + 2])}"
+        except (ValueError, IndexError):
+            pass
+
+    # Drop filler words that add noise; keep structural type words
+    FILLER = {"absolute", "strikes", "test", "spread", "credit"}
+    middle = [p for p in middle if p.lower() not in FILLER]
+
+    formatted = []
+    for i, p in enumerate(middle[:4]):
+        # Short alpha-only part → likely a ticker → UPPER; else Title
+        if i == 0 and p.isalpha() and len(p) <= 5:
+            formatted.append(p.upper())
+        else:
+            formatted.append(p.capitalize())
+
+    result = prefix
+    if formatted:
+        result += " " + " ".join(formatted)
+    if date_str:
+        result += " " + date_str
+    return result
+
+
+def _derive_trade_type(spec_id: str) -> tuple[str, str]:
+    """Return (label, color) for trade-type badge derived from spec_id keywords."""
+    from .theme import GREEN, RED, YELLOW, BLUE, TEXT_SECONDARY
+    s = (spec_id or "").lower()
+    if "basket" in s:
+        return "Basket", BLUE
+    if "bull_put" in s or "bull put" in s:
+        return "Bull Put", GREEN
+    if "bear_call" in s:
+        return "Bear Call", RED
+    if "iron_condor" in s or "condor" in s:
+        return "Iron Condor", YELLOW
+    if "calendar" in s:
+        return "Calendar", YELLOW
+    if "straddle" in s or "strangle" in s:
+        return "Vol Play", YELLOW
+    return "Options", TEXT_SECONDARY
+
+
+def _fmt_sched_col(state: str, scheduled_entry: str | None,
+                   time_to_stop: int | None) -> str:
+    """Format the Scheduled/Countdown cell per state."""
+    if state == "AUTHORED":
+        if scheduled_entry:
+            try:
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(
+                    scheduled_entry.replace("Z", "+00:00"))
+                return f"fires {dt.month}/{dt.day} {dt.strftime('%H:%M')} UTC"
+            except Exception:
+                return (scheduled_entry[:16] if scheduled_entry else "—")
+        return "—"
+    if state == "GATE_PENDING":
+        if time_to_stop is not None:
+            return f"gate pending  ({_fmt_countdown(time_to_stop)} to stop)"
+        return "gate pending"
+    if state in ("ACTIVE", "DISPATCHED", "MILESTONE_CHECK", "PARTIAL_CLOSED"):
+        if time_to_stop is not None:
+            return f"stop in {_fmt_countdown(time_to_stop)}"
+        return "—"
+    if state == "CLOSED":
+        return "closed"
+    return "—"
+
+
 def _build_strategy_rows(strategies: dict,
                           allowed_strats: set | None,
                           strat_to_scenarios: dict,
@@ -2960,22 +3061,34 @@ class Dashboard:
                         f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
                     )
                     sta_trades_columns = [
-                        {"name": "record_id",    "label": "Record ID",          "field": "record_id",    "align": "left",   "sortable": True},
-                        {"name": "spec_id",      "label": "Spec",               "field": "spec_id",      "align": "left",   "sortable": True},
+                        # Short readable label derived client-side from spec_id
+                        {"name": "label",        "label": "Trade",              "field": "label",        "align": "left",   "sortable": True},
+                        {"name": "trade_type",   "label": "Type",               "field": "trade_type",   "align": "center", "sortable": True},
                         {"name": "state",        "label": "State",              "field": "state",        "align": "center", "sortable": True},
+                        # Scheduled/countdown: "fires M/D HH:MM UTC" / "gate pending" / "stop in Xh Xm"
+                        {"name": "sched",        "label": "Scheduled / Stop",   "field": "sched",        "align": "left"},
+                        # Leg preview: filled strikes for ACTIVE; structural from spec for AUTHORED
                         {"name": "legs",         "label": "Legs",               "field": "legs",         "align": "left"},
                         {"name": "entry_credit", "label": "Entry Credit (USD)", "field": "entry_credit", "align": "right",  "sortable": True},
                         {"name": "mark",         "label": "Mark",               "field": "mark",         "align": "right",  "sortable": True},
                         {"name": "pnl_usd",      "label": "P&L (USD)",          "field": "pnl_usd",      "align": "right",  "sortable": True},
                         {"name": "pnl_bps",      "label": "P&L (bps)",          "field": "pnl_bps",      "align": "right",  "sortable": True, "sort": "numeric"},
-                        {"name": "countdown",    "label": "Countdown",          "field": "countdown",    "align": "right"},
                         {"name": "gate_chips",   "label": "Gate Status",        "field": "gate_chips",   "align": "left"},
-                        {"name": "entry_ts",     "label": "Entry",              "field": "entry_ts",     "align": "left",   "sortable": True},
-                        {"name": "age",          "label": "Age",                "field": "age",          "align": "right",  "sortable": True},
                     ]
                     sta_trades_table = ui.table(
                         columns=sta_trades_columns, rows=[], row_key="record_id",
                     ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
+                    sta_trades_table.add_slot("body-cell-trade_type", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.trade_type_color,
+                                border: '1px solid ' + props.row.trade_type_color,
+                                borderRadius: '4px',
+                                padding: '2px 6px',
+                                fontSize: '11px',
+                            }">{{ props.row.trade_type }}</span>
+                        </q-td>
+                    """)
                     sta_trades_table.add_slot("body-cell-state", r"""
                         <q-td :props="props">
                             <span :style="{
@@ -3082,33 +3195,38 @@ class Dashboard:
                                 _build_gate_chips(rec.get("gate_trace") or [])
                                 if state == "GATE_PENDING" else []
                             )
+                            spec_id = rec.get("spec_id", "?")
+                            tt_label, tt_color = _derive_trade_type(spec_id)
                             rows.append({
-                                "record_id":    rid,
-                                "spec_id":      rec.get("spec_id", "?"),
-                                "state":        state,
-                                "state_color":  _STA_STATE_COLORS.get(state, TEXT_SECONDARY),
-                                "legs":         _fmt_legs(rec.get("legs") or []),
-                                "entry_credit": ecredit_s,
-                                "mark":         mark_s,
-                                "pnl_usd":      upnl_s,
-                                "pnl_usd_raw":  upnl if upnl is not None else 0.0,
-                                "pnl_bps":      pnl_s,
-                                "pnl_raw":      pnl if pnl is not None else 0.0,
-                                "countdown":    countdown,
-                                "gate_chips":   gate_chips,
-                                "entry_ts":     sched[:19] if sched else "—",
-                                "age":          age_entry,
+                                "record_id":        str(rid),
+                                "label":            _derive_label(spec_id),
+                                "trade_type":       tt_label,
+                                "trade_type_color": tt_color,
+                                "spec_id":          spec_id,
+                                "state":            state,
+                                "state_color":      _STA_STATE_COLORS.get(state, TEXT_SECONDARY),
+                                "sched":            _fmt_sched_col(
+                                                        state, sched,
+                                                        rec.get("time_to_time_stop_seconds")),
+                                "legs":             _fmt_legs(rec.get("legs") or []),
+                                "entry_credit":     ecredit_s,
+                                "mark":             mark_s,
+                                "pnl_usd":          upnl_s,
+                                "pnl_usd_raw":      upnl if upnl is not None else 0.0,
+                                "pnl_bps":          pnl_s,
+                                "pnl_raw":          pnl if pnl is not None else 0.0,
+                                "countdown":        countdown,
+                                "gate_chips":       gate_chips,
                             })
                         if not rows:
-                            _empty = {"record_id": "—", "spec_id": "—", "state": "—",
-                                      "state_color": TEXT_SECONDARY, "legs": "—",
-                                      "entry_credit": "—", "mark": "—",
-                                      "pnl_usd": "—", "pnl_usd_raw": 0.0,
-                                      "pnl_bps": "—", "pnl_raw": 0.0,
-                                      "countdown": "—", "gate_chips": [],
-                                      "entry_ts": "—", "age": "—"}
-                            _empty["spec_id"] = "no active trades"
-                            rows = [_empty]
+                            rows = [{"record_id": "—", "label": "no active trades",
+                                     "trade_type": "—", "trade_type_color": TEXT_SECONDARY,
+                                     "spec_id": "—", "state": "—",
+                                     "state_color": TEXT_SECONDARY, "sched": "—",
+                                     "legs": "—", "entry_credit": "—", "mark": "—",
+                                     "pnl_usd": "—", "pnl_usd_raw": 0.0,
+                                     "pnl_bps": "—", "pnl_raw": 0.0,
+                                     "countdown": "—", "gate_chips": []}]
                         sta_trades_table.rows = rows
                         sta_trades_table.update()
 
@@ -3370,8 +3488,14 @@ class Dashboard:
                         with dashboard._lock:
                             history = dict(dashboard._sta_lifecycle_history)
                         known = sorted(history.keys())
-                        if _sta_lc_select.options != known:
-                            _sta_lc_select.options = known
+                        # Build option dict: key=record_id str, label="#N — Short Name"
+                        opts = {
+                            rid: (f"#{rid} — "
+                                  + _derive_label(history[rid][0].get("spec_id", rid)))
+                            for rid in known
+                        }
+                        if _sta_lc_select.options != opts:
+                            _sta_lc_select.options = opts
                             _sta_lc_select.update()
                             if known and _sta_lc_selected[0] is None:
                                 _sta_lc_selected[0] = known[0]
