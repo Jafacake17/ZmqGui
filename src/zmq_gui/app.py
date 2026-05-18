@@ -414,6 +414,31 @@ def _derive_trade_type(spec_id: str) -> tuple[str, str]:
     return "Options", TEXT_SECONDARY
 
 
+def _build_constraint_chips(cs_status: dict) -> list:
+    """Constraint pass/fail chips — same coloured-span pattern as gate_trace chips.
+
+    Reuses the existing entry-trace/gate-trace idiom:
+      green  = passed
+      red    = failed  (reason included in label)
+      grey   = not yet evaluated
+    Tooltip text carries the full reason so the chip label stays compact.
+    """
+    from .theme import GREEN, RED, TEXT_SECONDARY
+    chips = []
+    for key in ("SC1", "SC2", "SC3", "Q3"):
+        cs = (cs_status or {}).get(key)
+        if cs is None:
+            chips.append({"label": key, "color": TEXT_SECONDARY, "tooltip": "not evaluated"})
+            continue
+        passed = cs.get("passed")
+        reason = (cs.get("reason") or "").strip()
+        # Keep chip label short; full reason goes in tooltip
+        label = key
+        color = GREEN if passed is True else RED if passed is False else TEXT_SECONDARY
+        chips.append({"label": label, "color": color, "tooltip": reason or key})
+    return chips
+
+
 def _fmt_sched_col(state: str, scheduled_entry: str | None,
                    time_to_stop: int | None) -> str:
     """Format the Scheduled/Countdown cell per state."""
@@ -3238,25 +3263,81 @@ class Dashboard:
                     ui.label("STA Slate Composition").classes("mt-4").style(
                         f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
                     )
-                    # Slates: slate-level constraints per operator's STA spec.
-                    # SC1 = defined-risk count, SC2 = hawkish-hedge slot,
-                    # SC3 = short-convex count, Q3 = factor-diversity tally.
+                    # Fail-loud banner: slate_constraints_error means an unknown
+                    # constraint identifier appeared; operator+STA must investigate.
+                    _sta_slates_error_banner = ui.label("").style(
+                        f"color: {RED}; font-weight: bold; font-size: 13px;"
+                        f" background-color: #2a0000; padding: 6px 12px;"
+                        f" border-radius: 4px; display: none;"
+                    )
+
+                    _sta_slates_status = ui.label(
+                        "Waiting for STA slate data…"
+                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 6px;")
+
                     sta_slates_columns = [
-                        {"name": "slate_id",     "label": "Slate",         "field": "slate_id",     "align": "left",  "sortable": True},
-                        {"name": "constructs",   "label": "Constructs",    "field": "constructs",   "align": "center","sortable": True},
-                        {"name": "sc1_count",    "label": "SC1 (def-risk)","field": "sc1_count",    "align": "center","sortable": True},
-                        {"name": "sc2_status",   "label": "SC2 (hedge)",   "field": "sc2_status",   "align": "center","sortable": False},
-                        {"name": "sc3_count",    "label": "SC3 (short-cvx)","field": "sc3_count",   "align": "center","sortable": True},
-                        {"name": "q3_diversity", "label": "Q3 (diversity)","field": "q3_diversity", "align": "center","sortable": True},
-                        {"name": "status",       "label": "Status",        "field": "status",       "align": "center","sortable": True},
+                        {"name": "name",          "label": "Slate",           "field": "name",          "align": "left"},
+                        {"name": "status",        "label": "Status",          "field": "status",        "align": "center", "sortable": True},
+                        {"name": "authored",      "label": "Authored",        "field": "authored",      "align": "left"},
+                        {"name": "constituents",  "label": "Constituents",    "field": "constituents",  "align": "left"},
+                        {"name": "resolved",      "label": "Resolved",        "field": "resolved",      "align": "center"},
+                        # Constraint chips — one chip per SC1/SC2/SC3/Q3
+                        {"name": "constraints",   "label": "Constraints",     "field": "constraints",   "align": "left"},
                     ]
                     sta_slates_table = ui.table(
                         columns=sta_slates_columns, rows=[], row_key="slate_id",
                     ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
 
-                    _sta_slates_status = ui.label(
-                        "Waiting for STA slate data…"
-                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 6px;")
+                    # Status badge — same idiom as STA Trades state
+                    sta_slates_table.add_slot("body-cell-status", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.status_color,
+                                border: '1px solid ' + props.row.status_color,
+                                borderRadius: '4px',
+                                padding: '2px 7px',
+                                fontSize: '11px',
+                                fontWeight: 'bold',
+                            }">{{ props.row.status }}</span>
+                        </q-td>
+                    """)
+
+                    # Resolved badge
+                    sta_slates_table.add_slot("body-cell-resolved", r"""
+                        <q-td :props="props">
+                            <span :style="{
+                                color: props.row.resolved_color,
+                                fontSize: '11px',
+                                fontWeight: 'bold',
+                            }">{{ props.row.resolved }}</span>
+                        </q-td>
+                    """)
+
+                    # Constraint chips — reuse entry-trace chip pattern with tooltips
+                    sta_slates_table.add_slot("body-cell-constraints", r"""
+                        <q-td :props="props" style="vertical-align: top; padding: 4px 8px;">
+                            <div style="display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px;">
+                                <span v-for="chip in props.row.constraint_chips"
+                                      :key="chip.label"
+                                      :title="chip.tooltip"
+                                      :style="{
+                                        color: chip.color,
+                                        border: '1px solid ' + chip.color,
+                                        borderRadius: '3px',
+                                        padding: '1px 6px',
+                                        whiteSpace: 'nowrap',
+                                        cursor: chip.tooltip ? 'help' : 'default',
+                                      }">{{ chip.label }}</span>
+                            </div>
+                        </q-td>
+                    """)
+
+                    _SLATE_STATUS_COLORS = {
+                        "AUTHORED":   TEXT_SECONDARY,
+                        "ACTIVE":     GREEN,
+                        "CLOSED":     TEXT_SECONDARY,
+                        "CANCELLED":  RED,
+                    }
 
                     def update_sta_slates():
                         with dashboard._lock:
@@ -3272,17 +3353,59 @@ class Dashboard:
                                 replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
                             )
                             return
-                        _sta_slates_status.set_text("")
+
+                        # Collect any fail-loud constraint registry errors
+                        reg_errors = [
+                            f"{s.get('name','?')}: {s.get('slate_constraints_error')}"
+                            for s in slates
+                            if s.get("slate_constraints_error")
+                        ]
+                        if reg_errors:
+                            _sta_slates_error_banner.set_text(
+                                "CONSTRAINT REGISTRY ERROR — operator + STA must investigate: "
+                                + " | ".join(reg_errors)
+                            )
+                            _sta_slates_error_banner.style(
+                                replace=f"color: {RED}; font-weight: bold; font-size: 13px;"
+                                f" background-color: #2a0000; padding: 6px 12px;"
+                                f" border-radius: 4px; margin-top: 4px;"
+                            )
+                        else:
+                            _sta_slates_error_banner.set_text("")
+
+                        _sta_slates_status.set_text(
+                            f"Schema v{snap.get('schema_version', '?')} — "
+                            f"{len(slates)} slate(s)"
+                        )
+                        _sta_slates_status.style(
+                            replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
+                        )
+
                         rows = []
                         for s in slates:
+                            sid = s.get("slate_id", "?")
+                            status = s.get("status", "—")
+                            cs_status = s.get("slate_constraints_status") or {}
+                            resolved = s.get("all_constituents_resolved")
+                            # Readable constituent list
+                            constituent_labels = ", ".join(
+                                _derive_label(spec_id)
+                                for spec_id in (s.get("constituent_spec_ids") or [])
+                            )
+                            # Authored attribution
+                            authored = (f"{s.get('authored_by', '')} on {s.get('authored_at', '')}"
+                                        ).strip().strip("on").strip()
                             rows.append({
-                                "slate_id":     s.get("slate_id", "?"),
-                                "constructs":   str(s.get("construct_count", "—")),
-                                "sc1_count":    str(s.get("sc1_defined_risk_count", "—")),
-                                "sc2_status":   s.get("sc2_hawkish_hedge_status", "—"),
-                                "sc3_count":    str(s.get("sc3_short_convex_count", "—")),
-                                "q3_diversity": str(s.get("q3_factor_diversity", "—")),
-                                "status":       s.get("status", "—"),
+                                "slate_id":         sid,
+                                "name":             s.get("name", sid),
+                                "thesis":           s.get("thesis", ""),
+                                "status":           status,
+                                "status_color":     _SLATE_STATUS_COLORS.get(status, TEXT_SECONDARY),
+                                "authored":         authored,
+                                "constituents":     constituent_labels or "—",
+                                "resolved":         "✓ yes" if resolved else ("✗ no" if resolved is False else "—"),
+                                "resolved_color":   GREEN if resolved else (RED if resolved is False else TEXT_SECONDARY),
+                                "constraint_chips": _build_constraint_chips(cs_status),
                             })
                         sta_slates_table.rows = rows
                         sta_slates_table.update()
