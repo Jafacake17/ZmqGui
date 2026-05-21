@@ -34,11 +34,8 @@ tabs:
   crypto:       true   # Crypto paper-trader: strategies, chain block ticks, fills
   vuln:         false  # Adverse intelligence search (QuestDB adverse_intel table)
   quick_screen: false  # Ad-hoc backtest builder over the Quick Screen RPC service
-  sta_trades:   true   # STA active trades: lifecycle records + state badges + P&L bps
-  sta_slates:   true   # STA slate composition: constructs + SC1/SC2/SC3/Q3 constraints
-  sta_chain:    true   # STA options chain: expiry grid + IV index from chain_stats
-  sta_lifecycle: true  # STA audit log: state-transition history per selected trade
-  sta_health:   true   # STA health: dxlink status + schedule engine PID + errors
+  sta_book:         true   # STA Book: hierarchical slate→trade→leg view with filters
+  sta_diagnostics:  true   # STA Diagnostics: chain explorer + audit timeline + sidecar health
 
 # --- FTMO tab ---
 # The FTMO tab reads EA activity directly from the MT5 log files,

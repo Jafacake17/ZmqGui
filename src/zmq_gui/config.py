@@ -55,8 +55,7 @@ class GuiCfg:
     tabs: dict[str, bool] = field(default_factory=lambda: {
         "console": True, "ftmo": True, "arb": True, "vault": True,
         "crypto": True, "vuln": True, "quick_screen": True,
-        "sta_trades": True, "sta_slates": True, "sta_chain": True,
-        "sta_lifecycle": True, "sta_health": True,
+        "sta_book": True, "sta_diagnostics": True,
     })
     ftmo: FtmoCfg = field(default_factory=FtmoCfg)
     arb: ArbCfg = field(default_factory=ArbCfg)

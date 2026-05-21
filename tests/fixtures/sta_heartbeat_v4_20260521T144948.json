@@ -1,0 +1,181 @@
+{
+  "schema_version": 4,
+  "ts": "2026-05-21T14:49:48.319004+00:00",
+  "lifecycle": [],
+  "slates": [
+    {
+      "slate_id": "2wk-trades-5x-high-conf-2026-05-13",
+      "name": "2wk trades, 5x high-confidence",
+      "thesis": "Adam committee run 2026-05-13: locked A1 + A3",
+      "authored_at": "2026-05-13",
+      "authored_by": "magi/adam",
+      "status": "AUTHORED",
+      "constituent_spec_ids": [
+        "a1_nvda_bull_put_2026_05_29",
+        "a3_retail_earnings_basket_2026_05_22"
+      ],
+      "constituent_record_ids": [
+        1,
+        2
+      ],
+      "all_constituents_resolved": true,
+      "slate_constraints_status": {
+        "SC1": {
+          "passed": true,
+          "reason": "all 2 constituents are defined-risk",
+          "identifier": "defined_risk_required_for_all"
+        },
+        "SC2": {
+          "passed": false,
+          "reason": "no constituent carries slate_flags.is_hawkish_hedge",
+          "identifier": "hawkish_hedge_slot_present"
+        },
+        "SC3": {
+          "passed": true,
+          "reason": "2 short-convex spec(s) (cap 2): ['a1_nvda_bull_put_2026_05_29', 'a3_retail_earnings_basket_2026_05_22']",
+          "identifier": "max_short_convex_2"
+        },
+        "Q3": {
+          "passed": true,
+          "reason": "5 distinct factor(s): ['consumer_idio', 'nvda_idio', 'retail_earnings', 'tech_beta', 'vrp']",
+          "identifier": "min_distinct_factors_3"
+        }
+      },
+      "slate_constraints_error": null
+    }
+  ],
+  "fills_recent": [
+    {
+      "fill_id": "paper-aa29b0465ebc",
+      "combo_id": "smoke_test_nvda_absolute_strikes_2026_05_22@1779049701",
+      "record_id": 8,
+      "ts": "2026-05-17T20:28:28.029355+00:00",
+      "fill_kind": "paper",
+      "leg_count": 2
+    }
+  ],
+  "chain_status": {
+    "underlyings": [
+      "nvda"
+    ],
+    "last_chain_ts": "2026-05-21T14:49:38.430496",
+    "table_count": 1,
+    "per_underlying": {
+      "nvda": {
+        "strikes_loaded": 578,
+        "strikes_with_greeks": 108,
+        "last_quote_ts": "2026-05-21T14:49:38.430496",
+        "last_greeks_ts": "2026-05-21T14:49:33.614084",
+        "expiries": [
+          {
+            "expiry": "2026-05-18",
+            "strikes": 58
+          },
+          {
+            "expiry": "2026-05-22",
+            "strikes": 97
+          },
+          {
+            "expiry": "2026-05-26",
+            "strikes": 62
+          },
+          {
+            "expiry": "2026-05-27",
+            "strikes": 65
+          },
+          {
+            "expiry": "2026-05-29",
+            "strikes": 103
+          },
+          {
+            "expiry": "2026-06-01",
+            "strikes": 59
+          },
+          {
+            "expiry": "2026-06-03",
+            "strikes": 30
+          },
+          {
+            "expiry": "2026-06-05",
+            "strikes": 102
+          },
+          {
+            "expiry": "2026-06-12",
+            "strikes": 72
+          },
+          {
+            "expiry": "2026-06-18",
+            "strikes": 246
+          },
+          {
+            "expiry": "2026-06-26",
+            "strikes": 72
+          },
+          {
+            "expiry": "2026-07-02",
+            "strikes": 29
+          },
+          {
+            "expiry": "2026-07-17",
+            "strikes": 97
+          },
+          {
+            "expiry": "2026-08-21",
+            "strikes": 77
+          },
+          {
+            "expiry": "2026-09-18",
+            "strikes": 77
+          },
+          {
+            "expiry": "2026-10-16",
+            "strikes": 77
+          },
+          {
+            "expiry": "2026-11-20",
+            "strikes": 68
+          },
+          {
+            "expiry": "2026-12-18",
+            "strikes": 247
+          },
+          {
+            "expiry": "2027-01-15",
+            "strikes": 77
+          },
+          {
+            "expiry": "2027-03-19",
+            "strikes": 73
+          },
+          {
+            "expiry": "2027-06-17",
+            "strikes": 77
+          },
+          {
+            "expiry": "2027-09-17",
+            "strikes": 67
+          },
+          {
+            "expiry": "2027-12-17",
+            "strikes": 76
+          },
+          {
+            "expiry": "2028-01-21",
+            "strikes": 77
+          },
+          {
+            "expiry": "2028-06-16",
+            "strikes": 80
+          },
+          {
+            "expiry": "2028-12-15",
+            "strikes": 75
+          }
+        ]
+      }
+    }
+  },
+  "schedule_engine_pid": 1199756,
+  "version": "7e40f77",
+  "errors_recent": []
+}

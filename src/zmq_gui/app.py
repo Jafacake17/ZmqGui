@@ -75,7 +75,7 @@ _NgTimer._get_context = _safe_timer_get_context
 from .config import GuiCfg, StaCfg, load as load_config
 from .theme import (
     BG_DARK, BG_PANEL, BG_HEADER,
-    GREEN, YELLOW, RED, BLUE, TEXT_SECONDARY, TEXT_PRIMARY,
+    GREEN, YELLOW, RED, BLUE, TEXT_SECONDARY, TEXT_PRIMARY, TEXT_MUTED,
     PNL_LINE_COLOUR, ROW_EVEN, ROW_ODD,
     CHART_HEIGHT, TRADE_LOG_HEIGHT,
 )
@@ -439,8 +439,82 @@ def _build_constraint_chips(cs_status: dict) -> list:
     return chips
 
 
+def _build_book_hierarchy(snap: dict) -> dict:
+    """Build slate→trade→child tree from heartbeat lifecycle + slates.
+
+    Returns {slate_groups: [{slate, top_level_records: [{record, children}]}],
+             unslated: [{record, children}]}
+    """
+    lc_by_id = {str(r.get("record_id")): r for r in (snap.get("lifecycle") or [])}
+    slates = snap.get("slates") or []
+    slated_ids = {str(rid) for s in slates for rid in (s.get("constituent_record_ids") or [])}
+
+    children_map: dict[str, list] = {}
+    for rec in (snap.get("lifecycle") or []):
+        pid = rec.get("parent_id")
+        if pid is not None:
+            children_map.setdefault(str(pid), []).append(rec)
+
+    def get_node(rec):
+        rid = str(rec.get("record_id"))
+        return {
+            "record": rec,
+            "children": [get_node(c) for c in sorted(
+                children_map.get(rid, []), key=lambda r: r.get("record_id", 0))],
+        }
+
+    slate_groups = []
+    for s in slates:
+        top_level = [
+            get_node(r) for rid in (s.get("constituent_record_ids") or [])
+            if (r := lc_by_id.get(str(rid)))
+        ]
+        slate_groups.append({"slate": s, "top_level_records": top_level})
+
+    unslated = [
+        get_node(rec) for rec in (snap.get("lifecycle") or [])
+        if rec.get("parent_id") is None and str(rec.get("record_id")) not in slated_ids
+    ]
+    return {"slate_groups": slate_groups, "unslated": unslated}
+
+
+_CLOSED_BLOCKED_REASONS = frozenset({"HARD_VETO", "basket aborted", "indicator not registered"})
+
+
+def _is_closed_blocked(rec: dict) -> bool:
+    """Distinguish CLOSED-blocked (hard veto / aborted) from CLOSED-successful (time-stop)."""
+    reason = (rec.get("last_reason") or "").strip()
+    return any(reason.startswith(prefix) for prefix in _CLOSED_BLOCKED_REASONS)
+
+
+def _closed_badge_color(rec: dict) -> str:
+    """Return RED for CLOSED-blocked, TEXT_SECONDARY for CLOSED-successful."""
+    from .theme import RED, TEXT_SECONDARY
+    return RED if _is_closed_blocked(rec) else TEXT_SECONDARY
+
+
+def _filter_book_node(node: dict, filt: str) -> bool:
+    """Return True if a node should appear under filter `filt`."""
+    _LIVE_STATES = {"ACTIVE", "DISPATCHED", "MILESTONE_CHECK", "PARTIAL_CLOSED"}
+    _BLOCKED_STATES = {"GATE_PENDING"}
+    state = node["record"].get("state", "")
+    if filt == "live":
+        return state in _LIVE_STATES or any(
+            _filter_book_node(c, filt) for c in node.get("children", []))
+    if filt == "blocked":
+        return state in _BLOCKED_STATES or any(
+            _filter_book_node(c, filt) for c in node.get("children", []))
+    if filt == "closed24h":
+        # Schema v4: CLOSED records with closed_at within 24h are in lifecycle[].
+        # closed_at is null for non-CLOSED records.
+        return (state == "CLOSED" and node["record"].get("closed_at") is not None) or any(
+            _filter_book_node(c, filt) for c in node.get("children", []))
+    return True  # "all"
+
+
 def _fmt_sched_col(state: str, scheduled_entry: str | None,
-                   time_to_stop: int | None) -> str:
+                   time_to_stop: int | None,
+                   closed_at: str | None = None) -> str:
     """Format the Scheduled/Countdown cell per state."""
     if state == "AUTHORED":
         if scheduled_entry:
@@ -461,6 +535,13 @@ def _fmt_sched_col(state: str, scheduled_entry: str | None,
             return f"stop in {_fmt_countdown(time_to_stop)}"
         return "—"
     if state == "CLOSED":
+        if closed_at:
+            try:
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(closed_at.replace("Z", "+00:00"))
+                return f"closed {dt.month}/{dt.day} {dt.strftime('%H:%M')}"
+            except Exception:
+                pass
         return "closed"
     return "—"
 
@@ -1123,6 +1204,12 @@ class Dashboard:
                 strat_label = ui.label("Strategies: 0").style(f"color: {TEXT_SECONDARY};")
                 clock_label = ui.label("").style(f"color: {TEXT_SECONDARY};")
                 cal_label = ui.label("Calendar: OK").style(f"color: {GREEN}; font-size: 12px;")
+                _sta_strip_dxlink = ui.label("DX: —").style(
+                    f"color: {TEXT_SECONDARY}; font-size: 12px;")
+                _sta_strip_sched = ui.label("STA: —").style(
+                    f"color: {TEXT_SECONDARY}; font-size: 12px;")
+                _sta_strip_errors = ui.label("").style(
+                    f"color: {TEXT_SECONDARY}; font-size: 12px;")
 
             # Alert banner (hidden by default)
             alert_label = ui.label("").style(
@@ -1161,25 +1248,13 @@ class Dashboard:
                     ui.tab("Quick Screen").style(f"color: {TEXT_PRIMARY};")
                     if cfg.tabs.get("quick_screen", True) else None
                 )
-                sta_trades_tab = (
-                    ui.tab("STA Trades").style(f"color: {TEXT_PRIMARY};")
-                    if cfg.tabs.get("sta_trades", True) else None
+                sta_book_tab = (
+                    ui.tab("STA Book").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("sta_book", True) else None
                 )
-                sta_slates_tab = (
-                    ui.tab("STA Slates").style(f"color: {TEXT_PRIMARY};")
-                    if cfg.tabs.get("sta_slates", True) else None
-                )
-                sta_chain_tab = (
-                    ui.tab("STA Chain").style(f"color: {TEXT_PRIMARY};")
-                    if cfg.tabs.get("sta_chain", True) else None
-                )
-                sta_lifecycle_tab = (
-                    ui.tab("STA Lifecycle").style(f"color: {TEXT_PRIMARY};")
-                    if cfg.tabs.get("sta_lifecycle", True) else None
-                )
-                sta_health_tab = (
-                    ui.tab("STA Health").style(f"color: {TEXT_PRIMARY};")
-                    if cfg.tabs.get("sta_health", True) else None
+                sta_diagnostics_tab = (
+                    ui.tab("STA Diagnostics").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("sta_diagnostics", True) else None
                 )
 
             # Restore the last-selected tab across page reloads via per-browser
@@ -1194,11 +1269,8 @@ class Dashboard:
                     ("Crypto", crypto_tab),
                     ("Vuln", vuln_tab),
                     ("Quick Screen", qs_tab),
-                    ("STA Trades", sta_trades_tab),
-                    ("STA Slates", sta_slates_tab),
-                    ("STA Chain", sta_chain_tab),
-                    ("STA Lifecycle", sta_lifecycle_tab),
-                    ("STA Health", sta_health_tab),
+                    ("STA Book", sta_book_tab),
+                    ("STA Diagnostics", sta_diagnostics_tab),
                 ) if t is not None
             ]
             saved_tab = app.storage.user.get("active_tab")
@@ -3050,11 +3122,11 @@ class Dashboard:
 
                     ui.timer(0, _init_qs_tab, once=True)
 
-              # ================ STA TRADES TAB ================
-              # One row per lifecycle record from the latest STA heartbeat.
-              # Mirrors Open Trades in layout; lifecycle-state-aware badges.
-              if sta_trades_tab is not None:
-                with ui.tab_panel(sta_trades_tab):
+              # ================ STA BOOK TAB ================
+              # Hierarchical slate→trade→leg view. Replaces Trades + Slates tabs.
+              if sta_book_tab is not None:
+                with ui.tab_panel(sta_book_tab):
+
                     _STA_STATE_COLORS = {
                         "AUTHORED":        TEXT_SECONDARY,
                         "GATE_PENDING":    YELLOW,
@@ -3062,360 +3134,271 @@ class Dashboard:
                         "ACTIVE":          GREEN,
                         "MILESTONE_CHECK": YELLOW,
                         "PARTIAL_CLOSED":  YELLOW,
+                        # CLOSED uses dynamic colour: RED=blocked, grey=successful.
+                        # Use _closed_badge_color(rec) directly for CLOSED records.
                         "CLOSED":          TEXT_SECONDARY,
                     }
-                    ui.label("STA Active Trades").classes("mt-4").style(
-                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
-                    )
-                    sta_trades_columns = [
-                        # Short readable label derived client-side from spec_id
-                        {"name": "label",        "label": "Trade",              "field": "label",        "align": "left",   "sortable": True},
-                        {"name": "trade_type",   "label": "Type",               "field": "trade_type",   "align": "center", "sortable": True},
-                        {"name": "state",        "label": "State",              "field": "state",        "align": "center", "sortable": True},
-                        # Scheduled/countdown: "fires M/D HH:MM UTC" / "gate pending" / "stop in Xh Xm"
-                        {"name": "sched",        "label": "Scheduled / Stop",   "field": "sched",        "align": "left"},
-                        # Leg preview: filled strikes for ACTIVE; structural from spec for AUTHORED
-                        {"name": "legs",         "label": "Legs",               "field": "legs",         "align": "left"},
-                        {"name": "entry_credit", "label": "Entry Credit (USD)", "field": "entry_credit", "align": "right",  "sortable": True},
-                        {"name": "mark",         "label": "Mark",               "field": "mark",         "align": "right",  "sortable": True},
-                        {"name": "pnl_usd",      "label": "P&L (USD)",          "field": "pnl_usd",      "align": "right",  "sortable": True},
-                        {"name": "pnl_bps",      "label": "P&L (bps)",          "field": "pnl_bps",      "align": "right",  "sortable": True, "sort": "numeric"},
-                        {"name": "gate_chips",   "label": "Gate Status",        "field": "gate_chips",   "align": "left"},
-                    ]
-                    sta_trades_table = ui.table(
-                        columns=sta_trades_columns, rows=[], row_key="record_id",
-                    ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
-                    sta_trades_table.add_slot("body-cell-trade_type", r"""
-                        <q-td :props="props">
-                            <span :style="{
-                                color: props.row.trade_type_color,
-                                border: '1px solid ' + props.row.trade_type_color,
-                                borderRadius: '4px',
-                                padding: '2px 6px',
-                                fontSize: '11px',
-                            }">{{ props.row.trade_type }}</span>
-                        </q-td>
-                    """)
-                    sta_trades_table.add_slot("body-cell-state", r"""
-                        <q-td :props="props">
-                            <span :style="{
-                                color: props.row.state_color,
-                                border: '1px solid ' + props.row.state_color,
-                                borderRadius: '4px',
-                                padding: '2px 7px',
-                                fontSize: '11px',
-                                fontWeight: 'bold',
-                            }">{{ props.row.state }}</span>
-                        </q-td>
-                    """)
-                    sta_trades_table.add_slot("body-cell-pnl_bps", r"""
-                        <q-td :props="props">
-                            <span :style="{
-                                color: props.row.pnl_raw > 0 ? '""" + GREEN + r"""'
-                                     : props.row.pnl_raw < 0 ? '""" + RED + r"""'
-                                     : '""" + TEXT_SECONDARY + r"""',
-                                fontWeight: 'bold'
-                            }">{{ props.row.pnl_bps }}</span>
-                        </q-td>
-                    """)
-                    sta_trades_table.add_slot("body-cell-pnl_usd", r"""
-                        <q-td :props="props">
-                            <span :style="{
-                                color: props.row.pnl_usd_raw > 0 ? '""" + GREEN + r"""'
-                                     : props.row.pnl_usd_raw < 0 ? '""" + RED + r"""'
-                                     : '""" + TEXT_SECONDARY + r"""',
-                                fontWeight: 'bold'
-                            }">{{ props.row.pnl_usd }}</span>
-                        </q-td>
-                    """)
-                    # Gate chips: coloured spans per gate indicator — same pattern
-                    # as MTA's condition chips so operators have one familiar idiom.
-                    sta_trades_table.add_slot("body-cell-gate_chips", r"""
-                        <q-td :props="props" style="vertical-align: top; padding: 4px 8px;">
-                            <div style="display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px; line-height: 1.4; max-height: 80px; overflow-y: auto;">
-                                <span v-for="chip in props.row.gate_chips"
-                                      :key="chip.label"
-                                      :style="{
-                                        color: chip.color,
-                                        border: '1px solid ' + chip.color,
-                                        borderRadius: '3px',
-                                        padding: '1px 5px',
-                                        whiteSpace: 'nowrap',
-                                      }">{{ chip.label }}</span>
-                            </div>
-                        </q-td>
-                    """)
+                    _SLATE_STATUS_COLORS = {
+                        "AUTHORED":  TEXT_SECONDARY, "ACTIVE": GREEN,
+                        "CLOSED": TEXT_SECONDARY, "CANCELLED": RED,
+                    }
 
-                    _sta_trades_status = ui.label(
+                    _book_filter: list[str] = ["live"]
+
+                    with ui.row().classes("items-center gap-2 mt-3"):
+                        ui.label("Filter:").style(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+                        _book_filter_toggle = ui.toggle(
+                            options={"live": "Live", "blocked": "Blocked",
+                                     "closed24h": "Closed (24h)", "all": "All"},
+                            value="live",
+                        ).props("dense")
+                        _book_filter_toggle.on_value_change(
+                            lambda e: (_book_filter.__setitem__(0, e.value),
+                                       render_book()))
+
+                    _book_status = ui.label(
                         "Waiting for first STA heartbeat on tcp://127.0.0.1:5570…"
-                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 6px;")
+                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 4px;")
 
-                    def update_sta_trades():
+                    _book_area = ui.column().classes("w-full gap-3 mt-2")
+
+                    def render_book() -> None:
+                        _book_area.clear()
+                        with _book_area:
+                            with dashboard._lock:
+                                snap = dashboard._sta_latest
+                            if snap is None:
+                                return
+                            hierarchy = _build_book_hierarchy(snap)
+                            filt = _book_filter[0]
+
+                            def render_record_row(node: dict, indent: int = 0) -> None:
+                                rec = node["record"]
+                                children = node.get("children", [])
+                                spec_id = rec.get("spec_id", "?")
+                                state = rec.get("state", "?")
+                                rid = str(rec.get("record_id", "?"))
+                                label = _derive_label(spec_id)
+                                tt_label, tt_color = _derive_trade_type(spec_id)
+                                state_color = (
+                                    _closed_badge_color(rec) if state == "CLOSED"
+                                    else _STA_STATE_COLORS.get(state, TEXT_SECONDARY)
+                                )
+                                sched = rec.get("scheduled_entry") or ""
+                                sched_str = _fmt_sched_col(
+                                    state, sched, rec.get("time_to_time_stop_seconds"),
+                                    rec.get("closed_at"))
+                                gate_trace = rec.get("gate_trace") or []
+                                blocker = "; ".join(
+                                    g.get("blocker_reason") or ""
+                                    for g in gate_trace if not g.get("passed") and g.get("blocker_reason")
+                                ) or rec.get("last_reason", "")
+                                pnl = _coerce_float(rec.get("current_pnl_bps"))
+                                pnl_s = (f"+{pnl:.1f}" if pnl is not None and pnl >= 0
+                                         else f"{pnl:.1f}" if pnl is not None else "—")
+                                pnl_color = (GREEN if pnl and pnl > 0
+                                             else RED if pnl and pnl < 0 else TEXT_SECONDARY)
+
+                                has_legs = bool(rec.get("legs"))
+                                has_children = bool(children)
+
+                                pad = f"padding-left: {indent * 24}px;"
+
+                                if has_legs or has_children:
+                                    with ui.expansion(caption="").style(
+                                        f"background-color: {BG_PANEL}; border-radius: 4px; {pad}"
+                                    ) as exp:
+                                        with exp.add_slot("header"):
+                                            _render_record_header(
+                                                rid, label, tt_label, tt_color, state, state_color,
+                                                sched_str, pnl_s, pnl_color, blocker, gate_trace)
+                                        if has_children:
+                                            for child in children:
+                                                if _filter_book_node(child, filt) or filt == "all":
+                                                    render_record_row(child, indent + 1)
+                                        if has_legs:
+                                            _render_legs_table(rec.get("legs") or [])
+                                else:
+                                    with ui.row().classes("w-full items-center flex-wrap gap-2").style(
+                                        f"background-color: {BG_PANEL}; border-radius: 4px; "
+                                        f"padding: 6px 12px; {pad}"
+                                    ):
+                                        _render_record_header(
+                                            rid, label, tt_label, tt_color, state, state_color,
+                                            sched_str, pnl_s, pnl_color, blocker, gate_trace)
+
+                            def _render_record_header(rid, label, tt_label, tt_color, state,
+                                                       state_color, sched_str, pnl_s, pnl_color,
+                                                       blocker, gate_trace):
+                                ui.label(f"#{rid}").style(
+                                    f"color: {TEXT_MUTED}; font-size: 11px; min-width: 24px;")
+                                ui.label(label).style(
+                                    f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 13px; "
+                                    f"min-width: 160px;")
+                                ui.label(tt_label).style(
+                                    f"color: {tt_color}; border: 1px solid {tt_color}; "
+                                    f"border-radius: 4px; padding: 1px 6px; font-size: 11px;")
+                                ui.label(state).style(
+                                    f"color: {state_color}; border: 1px solid {state_color}; "
+                                    f"border-radius: 4px; padding: 2px 7px; font-size: 11px; "
+                                    f"font-weight: bold;")
+                                ui.label(sched_str).style(
+                                    f"color: {TEXT_SECONDARY}; font-size: 12px; min-width: 160px;")
+                                ui.label(pnl_s).style(
+                                    f"color: {pnl_color}; font-weight: bold; font-size: 12px;")
+                                if gate_trace:
+                                    chips = _build_gate_chips(gate_trace)
+                                    for chip in chips[:3]:
+                                        ui.label(chip["label"][:40]).style(
+                                            f"color: {chip['color']}; border: 1px solid {chip['color']}; "
+                                            f"border-radius: 3px; padding: 1px 4px; font-size: 10px;")
+                                elif blocker:
+                                    ui.label(blocker[:60]).style(
+                                        f"color: {TEXT_SECONDARY}; font-size: 11px; "
+                                        f"font-style: italic;")
+
+                            def _render_legs_table(legs: list) -> None:
+                                if not legs:
+                                    return
+                                leg_cols = [
+                                    {"name": "leg_id",  "label": "Leg",    "field": "leg_id",  "align": "left"},
+                                    {"name": "side",    "label": "Side",   "field": "side",    "align": "center"},
+                                    {"name": "contract","label": "Contract","field": "contract","align": "left"},
+                                    {"name": "qty",     "label": "Qty",    "field": "qty",     "align": "right"},
+                                    {"name": "entry_px","label": "Entry",  "field": "entry_px","align": "right"},
+                                ]
+                                leg_rows = []
+                                for leg in legs:
+                                    c = leg.get("contract") or {}
+                                    side = (leg.get("side") or "").upper()
+                                    right = (c.get("right") or "")[:1].upper()
+                                    contract_str = (
+                                        f"{c.get('underlying','')} {c.get('expiry','')[:10]} "
+                                        f"{c.get('strike','')}{right}"
+                                    )
+                                    leg_rows.append({
+                                        "leg_id":   leg.get("leg_id", "?"),
+                                        "side":     "LONG" if side in ("BUY","LONG") else "SHORT",
+                                        "contract": contract_str,
+                                        "qty":      str(leg.get("qty", "")),
+                                        "entry_px": str(_coerce_float(leg.get("entry_price")) or "—"),
+                                    })
+                                ui.table(columns=leg_cols, rows=leg_rows,
+                                         row_key="leg_id").classes("w-full").style(
+                                    f"background-color: {BG_PANEL}; margin-left: 24px;")
+
+                            # Render slate groups
+                            for grp in hierarchy["slate_groups"]:
+                                slate = grp["slate"]
+                                records = [n for n in grp["top_level_records"]
+                                           if _filter_book_node(n, filt) or filt == "all"]
+                                if not records:
+                                    continue
+                                cs_status = slate.get("slate_constraints_status") or {}
+                                constraint_chips = _build_constraint_chips(cs_status)
+                                err = slate.get("slate_constraints_error")
+
+                                with ui.card().classes("w-full").style(
+                                    f"background-color: {BG_HEADER}; border-radius: 6px;"
+                                ):
+                                    if err:
+                                        ui.label(f"CONSTRAINT REGISTRY ERROR: {err}").style(
+                                            f"color: {RED}; font-weight: bold; font-size: 12px; "
+                                            f"background-color: #2a0000; padding: 4px 8px; "
+                                            f"border-radius: 4px; margin-bottom: 4px;")
+                                    with ui.row().classes("w-full items-center gap-3 flex-wrap"):
+                                        ui.label(slate.get("name", "?")).style(
+                                            f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;")
+                                        status = slate.get("status", "—")
+                                        sc = _SLATE_STATUS_COLORS.get(status, TEXT_SECONDARY)
+                                        ui.label(status).style(
+                                            f"color: {sc}; border: 1px solid {sc}; "
+                                            f"border-radius: 4px; padding: 2px 7px; font-size: 11px; font-weight: bold;")
+                                        ui.label(f"by {slate.get('authored_by','')} "
+                                                 f"on {slate.get('authored_at','')}").style(
+                                            f"color: {TEXT_MUTED}; font-size: 11px;")
+                                        for chip in constraint_chips:
+                                            ui.label(chip["label"]).props(
+                                                f'title="{chip.get("tooltip","").replace(chr(34), chr(39))}"' 
+                                            ).style(
+                                                f"color: {chip['color']}; border: 1px solid {chip['color']}; "
+                                                f"border-radius: 3px; padding: 1px 6px; font-size: 11px; "
+                                                f"cursor: help;")
+                                    ui.separator().style("margin: 4px 0;")
+                                    with ui.column().classes("w-full gap-1"):
+                                        for node in records:
+                                            render_record_row(node)
+
+                            # Unslated group
+                            unslated = [n for n in hierarchy["unslated"]
+                                        if _filter_book_node(n, filt) or filt == "all"]
+                            if unslated:
+                                with ui.card().classes("w-full").style(
+                                    f"background-color: {BG_HEADER}; border-radius: 6px;"
+                                ):
+                                    ui.label("(unslated)").style(
+                                        f"color: {TEXT_SECONDARY}; font-weight: bold; font-size: 14px;")
+                                    ui.separator().style("margin: 4px 0;")
+                                    with ui.column().classes("w-full gap-1"):
+                                        for node in unslated:
+                                            render_record_row(node)
+
+                            if not hierarchy["slate_groups"] and not hierarchy["unslated"]:
+                                ui.label("No records match the current filter.").style(
+                                    f"color: {TEXT_SECONDARY}; font-style: italic; font-size: 13px;")
+
+                    def update_sta_book():
                         with dashboard._lock:
                             snap = dashboard._sta_latest
                             last_ts = dashboard._sta_last_ts
                         if snap is None:
                             return
                         age_s = time.time() - last_ts
-                        _sta_trades_status.set_text(
-                            f"STA heartbeat: {_fmt_age(age_s)} ago  ·  v{snap.get('version', '?')}"
+                        lc = snap.get("lifecycle") or []
+                        sl = snap.get("slates") or []
+                        _book_status.set_text(
+                            f"v{snap.get('schema_version','?')}· {len(lc)} records · "
+                            f"{len(sl)} slate(s) · {_fmt_age(age_s)} ago"
                         )
-                        _sta_trades_status.style(
-                            replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
-                        )
-                        rows = []
-                        for rec in (snap.get("lifecycle") or []):
-                            rid   = rec.get("record_id") or rec.get("spec_id") or "?"
-                            state = rec.get("state", "?")
-                            pnl   = _coerce_float(rec.get("current_pnl_bps"))
-                            pnl_s = (f"+{pnl:.1f}" if pnl is not None and pnl >= 0
-                                     else f"{pnl:.1f}" if pnl is not None else "—")
-                            # Decimal-as-string coercion at renderer boundary
-                            upnl   = _coerce_float(rec.get("unrealised_pnl"))
-                            upnl_s = (f"+{upnl:.2f}" if upnl is not None and upnl >= 0
-                                      else f"{upnl:.2f}" if upnl is not None else "—")
-                            ecredit   = _coerce_float(rec.get("entry_credit"))
-                            ecredit_s = (f"+{ecredit:.2f}" if ecredit is not None and ecredit >= 0
-                                         else f"{ecredit:.2f}" if ecredit is not None else "—")
-                            mark   = _coerce_float(rec.get("current_mark"))
-                            mark_s = f"{mark:.2f}" if mark is not None else "—"
-                            sched  = rec.get("scheduled_entry") or ""
-                            try:
-                                from datetime import datetime as _dt
-                                entry_dt = _dt.fromisoformat(sched.replace("Z", "+00:00"))
-                                age_entry = _fmt_age(time.time() - entry_dt.timestamp())
-                            except Exception:
-                                age_entry = "—"
-                            # Countdown: whichever is sooner — time_stop or expiry
-                            ts_stop = rec.get("time_to_time_stop_seconds")
-                            ts_exp  = rec.get("time_to_expiry_seconds")
-                            if ts_stop is not None and ts_exp is not None:
-                                countdown = _fmt_countdown(min(ts_stop, ts_exp))
-                            elif ts_stop is not None:
-                                countdown = _fmt_countdown(ts_stop)
-                            elif ts_exp is not None:
-                                countdown = _fmt_countdown(ts_exp)
-                            else:
-                                countdown = "—"
-                            # Gate chips for GATE_PENDING; empty list otherwise
-                            gate_chips = (
-                                _build_gate_chips(rec.get("gate_trace") or [])
-                                if state == "GATE_PENDING" else []
-                            )
-                            spec_id = rec.get("spec_id", "?")
-                            tt_label, tt_color = _derive_trade_type(spec_id)
-                            rows.append({
-                                "record_id":        str(rid),
-                                "label":            _derive_label(spec_id),
-                                "trade_type":       tt_label,
-                                "trade_type_color": tt_color,
-                                "spec_id":          spec_id,
-                                "state":            state,
-                                "state_color":      _STA_STATE_COLORS.get(state, TEXT_SECONDARY),
-                                "sched":            _fmt_sched_col(
-                                                        state, sched,
-                                                        rec.get("time_to_time_stop_seconds")),
-                                "legs":             _fmt_legs(rec.get("legs") or []),
-                                "entry_credit":     ecredit_s,
-                                "mark":             mark_s,
-                                "pnl_usd":          upnl_s,
-                                "pnl_usd_raw":      upnl if upnl is not None else 0.0,
-                                "pnl_bps":          pnl_s,
-                                "pnl_raw":          pnl if pnl is not None else 0.0,
-                                "countdown":        countdown,
-                                "gate_chips":       gate_chips,
-                            })
-                        if not rows:
-                            rows = [{"record_id": "—", "label": "no active trades",
-                                     "trade_type": "—", "trade_type_color": TEXT_SECONDARY,
-                                     "spec_id": "—", "state": "—",
-                                     "state_color": TEXT_SECONDARY, "sched": "—",
-                                     "legs": "—", "entry_credit": "—", "mark": "—",
-                                     "pnl_usd": "—", "pnl_usd_raw": 0.0,
-                                     "pnl_bps": "—", "pnl_raw": 0.0,
-                                     "countdown": "—", "gate_chips": []}]
-                        sta_trades_table.rows = rows
-                        sta_trades_table.update()
+                        _book_status.style(replace=f"color: {TEXT_SECONDARY}; font-size: 12px;")
+                        render_book()
 
-                    ui.timer(2.0, update_sta_trades)
+                    ui.timer(5.0, update_sta_book)
 
-              # ================ STA SLATES TAB ================
-              if sta_slates_tab is not None:
-                with ui.tab_panel(sta_slates_tab):
-                    ui.label("STA Slate Composition").classes("mt-4").style(
-                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
-                    )
-                    # Fail-loud banner: slate_constraints_error means an unknown
-                    # constraint identifier appeared; operator+STA must investigate.
-                    _sta_slates_error_banner = ui.label("").style(
-                        f"color: {RED}; font-weight: bold; font-size: 13px;"
-                        f" background-color: #2a0000; padding: 6px 12px;"
-                        f" border-radius: 4px; display: none;"
-                    )
+              # ================ STA DIAGNOSTICS TAB ================
+              # Chain explorer + lifecycle audit + sidecar health.
+              # Replaces Chain, Lifecycle, Health tabs.
+              if sta_diagnostics_tab is not None:
+                with ui.tab_panel(sta_diagnostics_tab):
 
-                    _sta_slates_status = ui.label(
-                        "Waiting for STA slate data…"
-                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 6px;")
-
-                    sta_slates_columns = [
-                        {"name": "name",          "label": "Slate",           "field": "name",          "align": "left"},
-                        {"name": "status",        "label": "Status",          "field": "status",        "align": "center", "sortable": True},
-                        {"name": "authored",      "label": "Authored",        "field": "authored",      "align": "left"},
-                        {"name": "constituents",  "label": "Constituents",    "field": "constituents",  "align": "left"},
-                        {"name": "resolved",      "label": "Resolved",        "field": "resolved",      "align": "center"},
-                        # Constraint chips — one chip per SC1/SC2/SC3/Q3
-                        {"name": "constraints",   "label": "Constraints",     "field": "constraints",   "align": "left"},
-                    ]
-                    sta_slates_table = ui.table(
-                        columns=sta_slates_columns, rows=[], row_key="slate_id",
-                    ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
-
-                    # Status badge — same idiom as STA Trades state
-                    sta_slates_table.add_slot("body-cell-status", r"""
-                        <q-td :props="props">
-                            <span :style="{
-                                color: props.row.status_color,
-                                border: '1px solid ' + props.row.status_color,
-                                borderRadius: '4px',
-                                padding: '2px 7px',
-                                fontSize: '11px',
-                                fontWeight: 'bold',
-                            }">{{ props.row.status }}</span>
-                        </q-td>
-                    """)
-
-                    # Resolved badge
-                    sta_slates_table.add_slot("body-cell-resolved", r"""
-                        <q-td :props="props">
-                            <span :style="{
-                                color: props.row.resolved_color,
-                                fontSize: '11px',
-                                fontWeight: 'bold',
-                            }">{{ props.row.resolved }}</span>
-                        </q-td>
-                    """)
-
-                    # Constraint chips — reuse entry-trace chip pattern with tooltips
-                    sta_slates_table.add_slot("body-cell-constraints", r"""
-                        <q-td :props="props" style="vertical-align: top; padding: 4px 8px;">
-                            <div style="display: flex; flex-wrap: wrap; gap: 4px; font-size: 11px;">
-                                <span v-for="chip in props.row.constraint_chips"
-                                      :key="chip.label"
-                                      :title="chip.tooltip"
-                                      :style="{
-                                        color: chip.color,
-                                        border: '1px solid ' + chip.color,
-                                        borderRadius: '3px',
-                                        padding: '1px 6px',
-                                        whiteSpace: 'nowrap',
-                                        cursor: chip.tooltip ? 'help' : 'default',
-                                      }">{{ chip.label }}</span>
-                            </div>
-                        </q-td>
-                    """)
-
-                    _SLATE_STATUS_COLORS = {
-                        "AUTHORED":   TEXT_SECONDARY,
-                        "ACTIVE":     GREEN,
-                        "CLOSED":     TEXT_SECONDARY,
-                        "CANCELLED":  RED,
+                    _SLATE_STATUS_COLORS_DIAG = {
+                        "AUTHORED":  TEXT_SECONDARY, "ACTIVE": GREEN,
+                        "CLOSED": TEXT_SECONDARY, "CANCELLED": RED,
                     }
 
-                    def update_sta_slates():
-                        with dashboard._lock:
-                            snap = dashboard._sta_latest
-                        if snap is None:
-                            return
-                        slates = snap.get("slates") or []
-                        if not slates:
-                            _sta_slates_status.set_text(
-                                "No slate data in heartbeat — STA may not emit slates yet."
-                            )
-                            _sta_slates_status.style(
-                                replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
-                            )
-                            return
+                    # ── Section 1: Chain Explorer ──────────────────────────────────────────
+                    ui.label("Chain Explorer").classes("mt-3").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 15px;")
+                    with ui.row().classes("items-center gap-3 mt-1"):
+                        _diag_ul_select = ui.select(
+                            options=[], value=None, label="Underlying",
+                        ).style(f"color: {TEXT_PRIMARY}; min-width: 110px;").props("dense options-dense")
+                        _diag_exp_select = ui.select(
+                            options=[], value=None, label="Expiry",
+                        ).style(f"color: {TEXT_PRIMARY}; min-width: 130px;").props("dense options-dense")
 
-                        # Collect any fail-loud constraint registry errors
-                        reg_errors = [
-                            f"{s.get('name','?')}: {s.get('slate_constraints_error')}"
-                            for s in slates
-                            if s.get("slate_constraints_error")
-                        ]
-                        if reg_errors:
-                            _sta_slates_error_banner.set_text(
-                                "CONSTRAINT REGISTRY ERROR — operator + STA must investigate: "
-                                + " | ".join(reg_errors)
-                            )
-                            _sta_slates_error_banner.style(
-                                replace=f"color: {RED}; font-weight: bold; font-size: 13px;"
-                                f" background-color: #2a0000; padding: 6px 12px;"
-                                f" border-radius: 4px; margin-top: 4px;"
-                            )
-                        else:
-                            _sta_slates_error_banner.set_text("")
-
-                        _sta_slates_status.set_text(
-                            f"Schema v{snap.get('schema_version', '?')} — "
-                            f"{len(slates)} slate(s)"
-                        )
-                        _sta_slates_status.style(
-                            replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
-                        )
-
-                        rows = []
-                        for s in slates:
-                            sid = s.get("slate_id", "?")
-                            status = s.get("status", "—")
-                            cs_status = s.get("slate_constraints_status") or {}
-                            resolved = s.get("all_constituents_resolved")
-                            # Readable constituent list
-                            constituent_labels = ", ".join(
-                                _derive_label(spec_id)
-                                for spec_id in (s.get("constituent_spec_ids") or [])
-                            )
-                            # Authored attribution
-                            authored = (f"{s.get('authored_by', '')} on {s.get('authored_at', '')}"
-                                        ).strip().strip("on").strip()
-                            rows.append({
-                                "slate_id":         sid,
-                                "name":             s.get("name", sid),
-                                "thesis":           s.get("thesis", ""),
-                                "status":           status,
-                                "status_color":     _SLATE_STATUS_COLORS.get(status, TEXT_SECONDARY),
-                                "authored":         authored,
-                                "constituents":     constituent_labels or "—",
-                                "resolved":         "✓ yes" if resolved else ("✗ no" if resolved is False else "—"),
-                                "resolved_color":   GREEN if resolved else (RED if resolved is False else TEXT_SECONDARY),
-                                "constraint_chips": _build_constraint_chips(cs_status),
-                            })
-                        sta_slates_table.rows = rows
-                        sta_slates_table.update()
-
-                    ui.timer(2.0, update_sta_slates)
-
-              # ================ STA CHAIN TAB ================
-              if sta_chain_tab is not None:
-                with ui.tab_panel(sta_chain_tab):
-                    ui.label("STA Options Chain").classes("mt-4").style(
-                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
-                    )
-                    # Per-underlying summary. Reads enriched chain_status first
-                    # (strikes_loaded, strikes_with_greeks, spot_estimate, etc.),
-                    # falls back to legacy chain_stats summary format.
-                    chain_summary_columns = [
-                        {"name": "underlying",    "label": "Underlying",      "field": "underlying",    "align": "left",  "sortable": True},
-                        {"name": "spot",          "label": "Spot",            "field": "spot",          "align": "right", "sortable": True},
-                        {"name": "strikes_loaded","label": "Strikes",         "field": "strikes_loaded","align": "center","sortable": True},
-                        {"name": "greeks_pct",    "label": "Greeks %",        "field": "greeks_pct",    "align": "right", "sortable": True},
-                        {"name": "last_quote",    "label": "Last Quote",      "field": "last_quote",    "align": "left"},
-                        {"name": "last_greeks",   "label": "Last Greeks",     "field": "last_greeks",   "align": "left"},
+                    _diag_chain_summary_cols = [
+                        {"name": "underlying",   "label": "Underlying",  "field": "underlying",   "align": "left", "sortable": True},
+                        {"name": "spot",         "label": "Spot",        "field": "spot",         "align": "right","sortable": True},
+                        {"name": "strikes",      "label": "Strikes",     "field": "strikes",      "align": "center","sortable": True},
+                        {"name": "greeks_pct",   "label": "Greeks %",    "field": "greeks_pct",   "align": "right","sortable": True},
+                        {"name": "last_quote",   "label": "Last Quote",  "field": "last_quote",   "align": "left"},
+                        {"name": "last_greeks",  "label": "Last Greeks", "field": "last_greeks",  "align": "left"},
                     ]
-                    chain_summary_table = ui.table(
-                        columns=chain_summary_columns, rows=[], row_key="underlying",
-                    ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
-                    # Greeks % colour: green >80%, yellow 50-80%, red <50%
-                    chain_summary_table.add_slot("body-cell-greeks_pct", r"""
+                    _diag_chain_table = ui.table(
+                        columns=_diag_chain_summary_cols, rows=[], row_key="underlying",
+                    ).classes("w-full mt-1").style(f"background-color: {BG_PANEL};")
+                    _diag_chain_table.add_slot("body-cell-greeks_pct", r"""
                         <q-td :props="props">
                             <span :style="{
                                 color: props.row.greeks_pct_raw > 80 ? '""" + GREEN + r"""'
@@ -3427,28 +3410,18 @@ class Dashboard:
                         </q-td>
                     """)
 
-                    _sta_chain_status = ui.label(
-                        "Waiting for STA chain stats…"
-                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 6px;")
-
-                    # Expiry sub-table — populated for the selected underlying
-                    ui.label("Expiries").classes("mt-4").style(
-                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;"
-                    )
-                    _sta_chain_ul_select = ui.select(
-                        options=[], value=None, label="Underlying",
-                    ).style(f"color: {TEXT_PRIMARY}; min-width: 120px;").props("dense options-dense")
-
-                    expiry_table = ui.table(
-                        columns=[
-                            {"name": "expiry",   "label": "Expiry",    "field": "expiry",   "align": "left",  "sortable": True},
-                            {"name": "strikes",  "label": "Strikes",   "field": "strikes",  "align": "center","sortable": True},
-                            {"name": "atm_iv",   "label": "ATM IV",    "field": "atm_iv",   "align": "right", "sortable": True},
-                        ],
-                        rows=[], row_key="expiry",
+                    _diag_expiry_cols = [
+                        {"name": "expiry",  "label": "Expiry",  "field": "expiry",  "align": "left", "sortable": True},
+                        {"name": "strikes", "label": "Strikes", "field": "strikes", "align": "center","sortable": True},
+                        {"name": "atm_iv",  "label": "ATM IV",  "field": "atm_iv",  "align": "right","sortable": True},
+                    ]
+                    ui.label("Expiries").classes("mt-2").style(
+                        f"color: {TEXT_SECONDARY}; font-weight: bold; font-size: 13px;")
+                    _diag_expiry_table = ui.table(
+                        columns=_diag_expiry_cols, rows=[], row_key="expiry",
                         pagination={"rowsPerPage": 30, "sortBy": "expiry"},
                     ).classes("w-full mt-1").style(f"background-color: {BG_PANEL};")
-                    expiry_table.add_slot("body-cell-atm_iv", r"""
+                    _diag_expiry_table.add_slot("body-cell-atm_iv", r"""
                         <q-td :props="props">
                             <span :style="{
                                 color: props.row.atm_iv_raw > 0.5 ? '""" + RED + r"""'
@@ -3458,231 +3431,100 @@ class Dashboard:
                         </q-td>
                     """)
 
-                    _sta_chain_snap_cache: list[dict] = [None]
+                    _diag_chain_snap: list[dict] = [None]
 
-                    def _rebuild_expiry_table():
-                        snap = _sta_chain_snap_cache[0]
-                        sel  = _sta_chain_ul_select.value
-                        if not snap or not sel:
-                            expiry_table.rows = []
-                            expiry_table.update()
+                    def _diag_rebuild_expiry():
+                        snap = _diag_chain_snap[0]
+                        ul = _diag_ul_select.value
+                        exp = _diag_exp_select.value
+                        if not snap or not ul:
                             return
-                        cs    = snap.get("chain_status") or {}
-                        stats = cs.get("per_underlying", {}).get(sel) or {}
-                        exps  = stats.get("expiries") or []
-                        rows  = []
-                        for ex in sorted(exps, key=lambda x: x.get("expiry", "")):
-                            iv = ex.get("atm_iv")
+                        pu = (snap.get("chain_status") or {}).get("per_underlying") or {}
+                        ul_data = pu.get(ul) or {}
+                        exps = [e for e in (ul_data.get("expiries") or [])
+                                if not exp or exp == "(all)" or e.get("expiry") == exp]
+                        rows = []
+                        for e in sorted(exps, key=lambda x: x.get("expiry", "")):
+                            iv = e.get("atm_iv")
                             rows.append({
-                                "expiry":     ex.get("expiry", "—"),
-                                "strikes":    str(ex.get("strikes", "—")),
-                                "atm_iv":     f"{iv:.4f}" if iv is not None else "—",
+                                "expiry": e.get("expiry", "—"),
+                                "strikes": str(e.get("strikes", "—")),
+                                "atm_iv": f"{iv:.4f}" if iv is not None else "—",
                                 "atm_iv_raw": float(iv) if iv is not None else -1.0,
                             })
-                        expiry_table.rows = rows or [{"expiry": "—", "strikes": "—", "atm_iv": "—", "atm_iv_raw": -1.0}]
-                        expiry_table.update()
+                        _diag_expiry_table.rows = rows or [{"expiry":"—","strikes":"—","atm_iv":"—","atm_iv_raw":-1}]
+                        _diag_expiry_table.update()
 
-                    _sta_chain_ul_select.on("update:model-value",
-                                            lambda e: _rebuild_expiry_table())
+                    _diag_ul_select.on("update:model-value", lambda e: _diag_rebuild_expiry())
 
-                    def update_sta_chain():
-                        with dashboard._lock:
-                            snap = dashboard._sta_latest
-                        if snap is None:
-                            return
-                        _sta_chain_snap_cache[0] = snap
-                        # Prefer enriched chain_status (has per_underlying dict);
-                        # fall back to legacy chain_stats summary format.
-                        chain_status = snap.get("chain_status") or {}
-                        chain_stats  = snap.get("chain_stats") or {}
-                        per_underlying = chain_status.get("per_underlying") or {}
-                        source = per_underlying if per_underlying else chain_stats
-                        rows = []
-                        for underlying, stats in sorted(source.items()):
-                            # Enriched path (chain_status.per_underlying)
-                            if per_underlying:
-                                loaded  = stats.get("strikes_loaded")
-                                greek   = stats.get("strikes_with_greeks")
-                                pct_raw = (greek / loaded * 100.0
-                                           if loaded and greek is not None else -1.0)
-                                pct_s   = f"{pct_raw:.0f}%" if pct_raw >= 0 else "—"
-                                spot    = _coerce_float(stats.get("spot_estimate"))
-                                lqt     = stats.get("last_quote_ts") or ""
-                                lgt     = stats.get("last_greeks_ts") or ""
-                            else:
-                                # Legacy chain_stats summary
-                                iv      = stats.get("iv_index")
-                                loaded  = stats.get("strikes_front")
-                                pct_raw = -1.0
-                                pct_s   = f"{stats.get('iv_index', '—')}"
-                                spot    = None
-                                lqt     = (snap.get("dxlink_status") or {}).get("last_quote_ts", "")
-                                lgt     = ""
-                            rows.append({
-                                "underlying":     underlying,
-                                "spot":           f"{spot:.4f}" if spot else "—",
-                                "strikes_loaded": str(loaded) if loaded is not None else "—",
-                                "greeks_pct":     pct_s,
-                                "greeks_pct_raw": pct_raw,
-                                "last_quote":     lqt[:19] if lqt else "—",
-                                "last_greeks":    lgt[:19] if lgt else "—",
-                            })
-                        if rows:
-                            _sta_chain_status.set_text("")
-                            # Sync underlying selector
-                            underlyings = [r["underlying"] for r in rows]
-                            if _sta_chain_ul_select.options != underlyings:
-                                _sta_chain_ul_select.options = underlyings
-                                _sta_chain_ul_select.update()
-                                if not _sta_chain_ul_select.value and underlyings:
-                                    _sta_chain_ul_select.value = underlyings[0]
-                            _rebuild_expiry_table()
-                        else:
-                            _sta_chain_status.set_text(
-                                "No chain_status/chain_stats in heartbeat — STA may not emit chain data yet."
-                            )
-                            _sta_chain_status.style(
-                                replace=f"color: {TEXT_SECONDARY}; font-size: 12px;"
-                            )
-                        chain_summary_table.rows = rows
-                        chain_summary_table.update()
+                    def _diag_update_expiry_options(ul, snap):
+                        pu = (snap.get("chain_status") or {}).get("per_underlying") or {}
+                        ul_data = pu.get(ul) or {}
+                        exps = [e.get("expiry","") for e in (ul_data.get("expiries") or []) if e.get("expiry")]
+                        all_opts = ["(all)"] + sorted(exps)
+                        if _diag_exp_select.options != all_opts:
+                            _diag_exp_select.options = all_opts
+                            _diag_exp_select.update()
+                            if not _diag_exp_select.value:
+                                _diag_exp_select.value = "(all)"
 
-                    ui.timer(2.0, update_sta_chain)
+                    _diag_exp_select.on("update:model-value",
+                                        lambda e: _diag_rebuild_expiry())
 
-              # ================ STA LIFECYCLE TAB ================
-              if sta_lifecycle_tab is not None:
-                with ui.tab_panel(sta_lifecycle_tab):
-                    ui.label("STA Trade Lifecycle Audit").classes("mt-4").style(
-                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
-                    )
-                    # Dropdown of known record_ids; table shows state transitions.
-                    _sta_lc_selected: list[str] = [None]
+                    ui.separator().classes("mt-4 mb-2")
 
-                    _sta_lc_select = ui.select(
+                    # ── Section 2: Lifecycle Audit ───────────────────────────────────────
+                    ui.label("Lifecycle Audit").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 15px;")
+                    _diag_lc_selected: list[str] = [None]
+                    _diag_lc_select = ui.select(
                         options=[], value=None, label="Select trade",
                     ).style(f"color: {TEXT_PRIMARY}; min-width: 260px;").props("dense options-dense")
 
-                    lifecycle_cols = [
-                        {"name": "ts",        "label": "Timestamp",        "field": "ts",        "align": "left"},
-                        {"name": "state",     "label": "State",            "field": "state",     "align": "center"},
-                        {"name": "spec_id",   "label": "Spec",             "field": "spec_id",   "align": "left"},
-                        {"name": "gate_note", "label": "Gate / Reason",    "field": "gate_note", "align": "left"},
+                    _diag_lc_cols = [
+                        {"name": "ts",        "label": "Timestamp",   "field": "ts",        "align": "left"},
+                        {"name": "state",     "label": "State",       "field": "state",     "align": "center"},
+                        {"name": "spec_id",   "label": "Spec",        "field": "spec_id",   "align": "left"},
+                        {"name": "gate_note", "label": "Gate / Reason","field": "gate_note", "align": "left"},
                     ]
-                    lifecycle_table = ui.table(
-                        columns=lifecycle_cols, rows=[], row_key="ts",
+                    _diag_lc_table = ui.table(
+                        columns=_diag_lc_cols, rows=[], row_key="ts",
                         pagination={"rowsPerPage": 50, "sortBy": "ts", "descending": True},
                     ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
-                    lifecycle_table.add_slot("body-cell-state", r"""
+                    _diag_lc_table.add_slot("body-cell-state", r"""
                         <q-td :props="props">
                             <span :style="{
                                 color: props.row.state_color,
                                 border: '1px solid ' + props.row.state_color,
-                                borderRadius: '4px',
-                                padding: '2px 6px',
-                                fontSize: '11px',
-                                fontWeight: 'bold',
+                                borderRadius: '4px', padding: '2px 6px',
+                                fontSize: '11px', fontWeight: 'bold',
                             }">{{ props.row.state }}</span>
                         </q-td>
                     """)
+                    _diag_lc_status = ui.label("").style(f"color: {TEXT_SECONDARY}; font-size: 12px;")
 
-                    _sta_lc_status = ui.label("").style(
-                        f"color: {TEXT_SECONDARY}; font-size: 12px;"
-                    )
+                    ui.separator().classes("mt-4 mb-2")
 
-                    def update_sta_lifecycle():
-                        with dashboard._lock:
-                            history = dict(dashboard._sta_lifecycle_history)
-                        known = sorted(history.keys())
-                        # Build option dict: key=record_id str, label="#N — Short Name"
-                        opts = {
-                            rid: (f"#{rid} — "
-                                  + _derive_label(history[rid][0].get("spec_id", rid)))
-                            for rid in known
-                        }
-                        if _sta_lc_select.options != opts:
-                            _sta_lc_select.options = opts
-                            _sta_lc_select.update()
-                            if known and _sta_lc_selected[0] is None:
-                                _sta_lc_selected[0] = known[0]
-                                _sta_lc_select.value = known[0]
-                        raw_sel = _sta_lc_selected[0] or (_sta_lc_select.value if _sta_lc_select.value else None)
-                        sel = str(raw_sel) if raw_sel is not None else None
-                        if not sel or sel not in history:
-                            _sta_lc_status.set_text(
-                                "Waiting for STA lifecycle data…" if not known
-                                else "Select a trade above."
-                            )
-                            lifecycle_table.rows = []
-                            lifecycle_table.update()
-                            return
-                        transitions = history[sel]
-                        rows = []
-                        for t in transitions:
-                            state = t.get("state", "?")
-                            # Build gate note from stored gate_trace blockers
-                            gate_trace = t.get("gate_trace") or []
-                            blockers = [g.get("blocker_reason") or ""
-                                        for g in gate_trace if not g.get("passed")]
-                            gate_note = "; ".join(b for b in blockers if b)
-                            if not gate_note:
-                                gate_note = t.get("last_reason", "")
-                            rows.append({
-                                "ts":          t.get("ts", "")[:19],
-                                "state":       state,
-                                "state_color": {"ACTIVE": GREEN, "CLOSED": TEXT_SECONDARY,
-                                                "GATE_PENDING": YELLOW, "DISPATCHED": BLUE,
-                                                "MILESTONE_CHECK": YELLOW,
-                                                "PARTIAL_CLOSED": YELLOW}.get(state, TEXT_SECONDARY),
-                                "spec_id":     t.get("spec_id", ""),
-                                "gate_note":   gate_note,
-                            })
-                        _sta_lc_status.set_text(f"{len(rows)} transition(s) recorded for {sel}")
-                        lifecycle_table.rows = rows
-                        lifecycle_table.update()
-
-                    _sta_lc_select.on("update:model-value",
-                                      lambda e: (_sta_lc_selected.__setitem__(
-                                          0, str(e.value) if e.value is not None else None),
-                                                 update_sta_lifecycle()))
-                    ui.timer(2.0, update_sta_lifecycle)
-
-              # ================ STA HEALTH TAB ================
-              if sta_health_tab is not None:
-                with ui.tab_panel(sta_health_tab):
-                    ui.label("STA Health").classes("mt-4").style(
-                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 16px;"
-                    )
+                    # ── Section 3: Sidecar Health ──────────────────────────────────────────
+                    ui.label("Sidecar Health").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 15px;")
                     with ui.row().classes("w-full gap-4 mt-2"):
-                        # Heartbeat summary card
                         with ui.card().classes("flex-1").style(f"background-color: {BG_PANEL};"):
-                            ui.label("Heartbeat").style(
-                                f"color: {TEXT_SECONDARY}; font-weight: bold;"
-                            )
-                            _sta_hb_label = ui.label("Waiting…").style(
-                                f"color: {YELLOW}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
-                            )
-                        # DXLink status card
+                            ui.label("Heartbeat").style(f"color: {TEXT_SECONDARY}; font-weight: bold;")
+                            _diag_hb_label = ui.label("Waiting…").style(
+                                f"color: {YELLOW}; white-space: pre-wrap; font-family: monospace; font-size: 13px;")
                         with ui.card().classes("flex-1").style(f"background-color: {BG_PANEL};"):
-                            ui.label("DXLink Subscriber").style(
-                                f"color: {TEXT_SECONDARY}; font-weight: bold;"
-                            )
-                            _sta_dxlink_label = ui.label("—").style(
-                                f"color: {TEXT_PRIMARY}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
-                            )
-                        # Schedule engine card
+                            ui.label("DXLink").style(f"color: {TEXT_SECONDARY}; font-weight: bold;")
+                            _diag_dxlink_label = ui.label("—").style(
+                                f"color: {TEXT_PRIMARY}; white-space: pre-wrap; font-family: monospace; font-size: 13px;")
                         with ui.card().classes("flex-1").style(f"background-color: {BG_PANEL};"):
-                            ui.label("Schedule Engine").style(
-                                f"color: {TEXT_SECONDARY}; font-weight: bold;"
-                            )
-                            _sta_engine_label = ui.label("—").style(
-                                f"color: {TEXT_PRIMARY}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
-                            )
+                            ui.label("Schedule Engine").style(f"color: {TEXT_SECONDARY}; font-weight: bold;")
+                            _diag_engine_label = ui.label("—").style(
+                                f"color: {TEXT_PRIMARY}; white-space: pre-wrap; font-family: monospace; font-size: 13px;")
 
-                    # Errors table
-                    ui.label("Recent Errors").classes("mt-4").style(
-                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;"
-                    )
-                    sta_errors_table = ui.table(
+                    ui.label("Recent Errors").classes("mt-3").style(
+                        f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;")
+                    _diag_errors_table = ui.table(
                         columns=[
                             {"name": "ts",        "label": "Time",      "field": "ts",        "align": "left"},
                             {"name": "message",   "label": "Message",   "field": "message",   "align": "left"},
@@ -3690,37 +3532,109 @@ class Dashboard:
                         ],
                         rows=[], row_key="ts",
                     ).classes("w-full mt-2").style(f"background-color: {BG_PANEL};")
-                    sta_errors_table.add_slot("body-cell-message", r"""
+                    _diag_errors_table.add_slot("body-cell-message", r"""
                         <q-td :props="props">
                             <span :style="{color: '""" + RED + r"""'}">{{ props.row.message }}</span>
                         </q-td>
                     """)
 
-                    def update_sta_health():
+                    def update_sta_diagnostics():
                         with dashboard._lock:
                             snap = dashboard._sta_latest
                             last_ts = dashboard._sta_last_ts
+                            lc_history = dict(dashboard._sta_lifecycle_history)
                         if snap is None:
                             return
-                        age_s = time.time() - last_ts
-                        age_color = (GREEN if age_s < 30
-                                     else YELLOW if age_s < 120 else RED)
-                        _sta_hb_label.set_text(
-                            f"Age:      {_fmt_age(age_s)} ago\n"
-                            f"Version:  {snap.get('version', '?')}\n"
-                            f"PID:      {snap.get('schedule_engine_pid', '?')}\n"
-                            f"TS:       {(snap.get('ts') or '')[:19]}"
-                        )
-                        _sta_hb_label.style(
-                            replace=f"color: {age_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
-                        )
-                        dx = snap.get("dxlink_status") or {}
-                        # DXLink freshness: prefer chain_status.per_underlying timestamps
-                        # (enriched schema), fall back to dxlink_status.last_quote_ts.
+
+                        # Chain section
+                        _diag_chain_snap[0] = snap
                         chain_status = snap.get("chain_status") or {}
                         per_ul = chain_status.get("per_underlying") or {}
-                        now_t = time.time()
+                        underlyings = sorted(per_ul.keys())
+                        if _diag_ul_select.options != underlyings:
+                            _diag_ul_select.options = underlyings
+                            _diag_ul_select.update()
+                            if underlyings and not _diag_ul_select.value:
+                                _diag_ul_select.value = underlyings[0]
+                        if _diag_ul_select.value:
+                            _diag_update_expiry_options(_diag_ul_select.value, snap)
+                            _diag_rebuild_expiry()
+
+                        chain_rows = []
+                        for ul, stats in sorted(per_ul.items()):
+                            loaded = stats.get("strikes_loaded")
+                            greek = stats.get("strikes_with_greeks")
+                            pct_raw = (greek / loaded * 100.0
+                                       if loaded and greek is not None else -1.0)
+                            pct_s = f"{pct_raw:.0f}%" if pct_raw >= 0 else "—"
+                            spot = _coerce_float(stats.get("spot_estimate"))
+                            lqt = stats.get("last_quote_ts") or ""
+                            lgt = stats.get("last_greeks_ts") or ""
+                            chain_rows.append({
+                                "underlying": ul,
+                                "spot": f"{spot:.4f}" if spot else "—",
+                                "strikes": str(loaded) if loaded is not None else "—",
+                                "greeks_pct": pct_s,
+                                "greeks_pct_raw": pct_raw,
+                                "last_quote": lqt[:19] if lqt else "—",
+                                "last_greeks": lgt[:19] if lgt else "—",
+                            })
+                        _diag_chain_table.rows = chain_rows
+                        _diag_chain_table.update()
+
+                        # Lifecycle audit section
+                        known = sorted(lc_history.keys())
+                        opts = {
+                            rid: f"#{rid} — {_derive_label(lc_history[rid][0].get('spec_id', rid))}"
+                            for rid in known
+                        }
+                        if _diag_lc_select.options != opts:
+                            _diag_lc_select.options = opts
+                            _diag_lc_select.update()
+                            if known and _diag_lc_selected[0] is None:
+                                _diag_lc_selected[0] = known[0]
+                                _diag_lc_select.value = known[0]
+                        raw_sel = _diag_lc_selected[0] or (_diag_lc_select.value if _diag_lc_select.value else None)
+                        sel = str(raw_sel) if raw_sel is not None else None
+                        if sel and sel in lc_history:
+                            transitions = lc_history[sel]
+                            lc_rows = []
+                            for t in transitions:
+                                state = t.get("state", "?")
+                                gate_trace = t.get("gate_trace") or []
+                                blockers = [g.get("blocker_reason") or "" for g in gate_trace if not g.get("passed")]
+                                gate_note = "; ".join(b for b in blockers if b) or t.get("last_reason", "")
+                                lc_rows.append({
+                                    "ts": t.get("ts", "")[:19],
+                                    "state": state,
+                                    "state_color": {"ACTIVE": GREEN, "CLOSED": TEXT_SECONDARY,
+                                                    "GATE_PENDING": YELLOW, "DISPATCHED": BLUE,
+                                                    "MILESTONE_CHECK": YELLOW,
+                                                    "PARTIAL_CLOSED": YELLOW}.get(state, TEXT_SECONDARY),
+                                    "spec_id": t.get("spec_id", ""),
+                                    "gate_note": gate_note,
+                                })
+                            _diag_lc_status.set_text(f"{len(lc_rows)} transition(s) for {sel}")
+                            _diag_lc_table.rows = lc_rows
+                            _diag_lc_table.update()
+
+                        # Sidecar health section
+                        age_s = time.time() - last_ts
+                        age_color = GREEN if age_s < 30 else YELLOW if age_s < 120 else RED
+                        _diag_hb_label.set_text(
+                            f"Age:     {_fmt_age(age_s)} ago\n"
+                            f"Version: {snap.get('version', '?')}\n"
+                            f"PID:     {snap.get('schedule_engine_pid', '?')}\n"
+                            f"TS:      {(snap.get('ts') or '')[:19]}"
+                        )
+                        _diag_hb_label.style(
+                            replace=f"color: {age_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;")
+
+                        dx = snap.get("dxlink_status") or {}
+                        syms_count = (dx.get("symbols_subscribed")
+                                      or chain_status.get("table_count") or len(per_ul) or "—")
                         quote_ages = []
+                        now_t = time.time()
                         for ul_data in per_ul.values():
                             lqt = ul_data.get("last_quote_ts")
                             if lqt:
@@ -3730,45 +3644,23 @@ class Dashboard:
                                     quote_ages.append(now_t - dt.timestamp())
                                 except Exception:
                                     pass
-                        if not quote_ages:
-                            raw_lqt = dx.get("last_quote_ts") or ""
-                            if raw_lqt:
-                                try:
-                                    from datetime import datetime as _dt
-                                    dt = _dt.fromisoformat(raw_lqt.replace("Z", "+00:00"))
-                                    quote_ages.append(now_t - dt.timestamp())
-                                except Exception:
-                                    pass
                         if quote_ages:
                             best_age = min(quote_ages)
-                            dx_fresh_color = (GREEN if best_age < 60
-                                              else YELLOW if best_age < 300 else RED)
-                            dx_fresh_str = f"{_fmt_age(best_age)} ago"
+                            dx_color = GREEN if best_age < 60 else YELLOW if best_age < 300 else RED
+                            dx_fresh = f"{_fmt_age(best_age)} ago"
                         else:
-                            dx_fresh_color = TEXT_SECONDARY
-                            dx_fresh_str = "—"
-                        # symbols_subscribed: prefer dxlink_status field,
-                        # fall back to chain_status.table_count (real heartbeat
-                        # has no dxlink_status key — count comes from chain_status)
-                        syms_count = (dx.get("symbols_subscribed")
-                                      or chain_status.get("table_count")
-                                      or len(per_ul)
-                                      or "—")
-                        _sta_dxlink_label.set_text(
-                            f"Symbols:    {syms_count}\n"
-                            f"Last quote: {dx_fresh_str}"
-                        )
-                        _sta_dxlink_label.style(
-                            replace=f"color: {dx_fresh_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
-                        )
+                            dx_color = TEXT_SECONDARY
+                            dx_fresh = "—"
+                        _diag_dxlink_label.set_text(f"Symbols:    {syms_count}\nLast quote: {dx_fresh}")
+                        _diag_dxlink_label.style(
+                            replace=f"color: {dx_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;")
+
                         pid = snap.get("schedule_engine_pid")
-                        pid_color = GREEN if pid else RED
-                        _sta_engine_label.set_text(
-                            f"PID: {pid or 'not running'}"
-                        )
-                        _sta_engine_label.style(
-                            replace=f"color: {pid_color}; white-space: pre-wrap; font-family: monospace; font-size: 13px;"
-                        )
+                        _diag_engine_label.set_text(f"PID: {pid or 'not running'}")
+                        _diag_engine_label.style(
+                            replace=f"color: {GREEN if pid else RED}; white-space: pre-wrap; "
+                                    f"font-family: monospace; font-size: 13px;")
+
                         errs = snap.get("errors_recent") or []
                         err_rows = []
                         for i, e in enumerate(errs[:20]):
@@ -3777,16 +3669,20 @@ class Dashboard:
                             else:
                                 ts_raw = e.get("timestamp") or e.get("ts") or str(i)
                                 err_rows.append({
-                                    "ts":        ts_raw[:19] if isinstance(ts_raw, str) else str(ts_raw),
-                                    "message":   e.get("message") or e.get("error") or str(e),
+                                    "ts": ts_raw[:19] if isinstance(ts_raw, str) else str(ts_raw),
+                                    "message": e.get("message") or e.get("error") or str(e),
                                     "record_id": e.get("record_id") or e.get("spec_id") or "",
                                 })
                         if not err_rows:
                             err_rows = [{"ts": "—", "message": "no errors", "record_id": ""}]
-                        sta_errors_table.rows = err_rows
-                        sta_errors_table.update()
+                        _diag_errors_table.rows = err_rows
+                        _diag_errors_table.update()
 
-                    ui.timer(2.0, update_sta_health)
+                    _diag_lc_select.on("update:model-value",
+                                       lambda e: (_diag_lc_selected.__setitem__(
+                                           0, str(e.value) if e.value is not None else None),
+                                                  update_sta_diagnostics()))
+                    ui.timer(2.0, update_sta_diagnostics)
 
             # ---- Periodic UI update — Console tab refresh ----
             # Skipped when Console tab is disabled.
@@ -4409,6 +4305,48 @@ class Dashboard:
                     )
 
             ui.timer(5.0, update_cal_badge)
+
+            def update_sta_strip():
+                with dashboard._lock:
+                    snap = dashboard._sta_latest
+                    last_ts = dashboard._sta_last_ts
+                if snap is None:
+                    return
+                # DXLink freshness from chain_status.per_underlying
+                chain_status = snap.get("chain_status") or {}
+                per_ul = chain_status.get("per_underlying") or {}
+                now_t = time.time()
+                quote_ages = []
+                for ul_data in per_ul.values():
+                    lqt = ul_data.get("last_quote_ts")
+                    if lqt:
+                        try:
+                            from datetime import datetime as _dt
+                            dt = _dt.fromisoformat(lqt.replace("Z", "+00:00"))
+                            quote_ages.append(now_t - dt.timestamp())
+                        except Exception:
+                            pass
+                if quote_ages:
+                    best = min(quote_ages)
+                    dx_color = GREEN if best < 300 else YELLOW if best < 3600 else RED
+                    _sta_strip_dxlink.set_text(f"DX: {_fmt_age(best)}")
+                    _sta_strip_dxlink.style(replace=f"color: {dx_color}; font-size: 12px;")
+                # Schedule sidecar freshness from heartbeat ts
+                hb_age = time.time() - last_ts
+                sc_color = GREEN if hb_age < 90 else YELLOW if hb_age < 300 else RED
+                _sta_strip_sched.set_text(f"STA: {_fmt_age(hb_age)}")
+                _sta_strip_sched.style(replace=f"color: {sc_color}; font-size: 12px;")
+                # Errors
+                errs = snap.get("errors_recent") or []
+                n_err = len(errs)
+                err_color = TEXT_SECONDARY if n_err == 0 else YELLOW if n_err < 6 else RED
+                if n_err > 0:
+                    _sta_strip_errors.set_text(f"{n_err} err")
+                    _sta_strip_errors.style(replace=f"color: {err_color}; font-size: 12px;")
+                else:
+                    _sta_strip_errors.set_text("")
+
+            ui.timer(5.0, update_sta_strip)
 
         # ------------------------------------------------------------------
         # Chart routes — /chart/<trade_id> and /chart/legacy/<sid>/<sym>
