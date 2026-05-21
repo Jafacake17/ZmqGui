@@ -293,6 +293,49 @@ def test_past_trades_pnl_consistent_with_pct():
 # ── Screenshot archive ────────────────────────────────────────────────────────
 
 @skip_if_unavailable
+def test_sta_book_slate_card_renders_when_constituents_empty():
+    """Slate card must show with constraint chips even when lifecycle[] is empty.
+
+    Tests against the live GUI (which currently has v4 with 0 lifecycle records
+    but 1 slate), proving the operator-approved quiet-window visibility.
+    """
+    async def run():
+        page, _, browser, pw = await _open_page()
+        try:
+            await _click_tab(page, "STA Book")
+            got_data = await _wait_for_sta_data(page)
+            assert got_data, "STA Book: no heartbeat within 45s"
+
+            html = await page.content()
+            body = await page.inner_text("body")
+            lines = [l.strip() for l in body.splitlines() if l.strip()]
+
+            # Slate name must be in DOM even with 0 lifecycle records
+            # Live v4 has slate "2wk trades, 5x high-confidence"
+            slate_present = any("2wk" in l or "high-conf" in l or "trades" in l.lower()
+                                 for l in lines) or "2wk" in html
+            assert slate_present, \
+                "Slate card not found — slate should render even with 0 lifecycle records"
+
+            # Constraint chips (SC1/SC2/SC3/Q3) must be in HTML
+            constraint_chips_present = any(f"SC{n}" in html for n in (1, 2, 3))
+            assert constraint_chips_present, \
+                "Constraint chips missing from slate card"
+
+            # Empty-state note must be visible
+            empty_note_present = (
+                "No constituent records" in body
+                or "active / recently-closed" in body
+            )
+            assert empty_note_present, \
+                "Empty-constituent note missing from slate card body"
+
+        finally:
+            await browser.close(); await pw.stop()
+    asyncio.run(run())
+
+
+@skip_if_unavailable
 def test_screenshot_both_sta_tabs():
     """Screenshot STA Book and STA Diagnostics for visual archive."""
     async def run():

@@ -3287,13 +3287,14 @@ class Dashboard:
                                          row_key="leg_id").classes("w-full").style(
                                     f"background-color: {BG_PANEL}; margin-left: 24px;")
 
-                            # Render slate groups
+                            # Render slate groups — always show the card even when
+                            # no constituent records match the current filter, so
+                            # the slate's existence + constraint posture stays
+                            # visible during quiet windows.
                             for grp in hierarchy["slate_groups"]:
                                 slate = grp["slate"]
                                 records = [n for n in grp["top_level_records"]
                                            if _filter_book_node(n, filt) or filt == "all"]
-                                if not records:
-                                    continue
                                 cs_status = slate.get("slate_constraints_status") or {}
                                 constraint_chips = _build_constraint_chips(cs_status)
                                 err = slate.get("slate_constraints_error")
@@ -3319,15 +3320,23 @@ class Dashboard:
                                             f"color: {TEXT_MUTED}; font-size: 11px;")
                                         for chip in constraint_chips:
                                             ui.label(chip["label"]).props(
-                                                f'title="{chip.get("tooltip","").replace(chr(34), chr(39))}"' 
+                                                f'title="{chip.get("tooltip","").replace(chr(34), chr(39))}"'
                                             ).style(
                                                 f"color: {chip['color']}; border: 1px solid {chip['color']}; "
                                                 f"border-radius: 3px; padding: 1px 6px; font-size: 11px; "
                                                 f"cursor: help;")
                                     ui.separator().style("margin: 4px 0;")
                                     with ui.column().classes("w-full gap-1"):
-                                        for node in records:
-                                            render_record_row(node)
+                                        if records:
+                                            for node in records:
+                                                render_record_row(node)
+                                        else:
+                                            ui.label(
+                                                "No constituent records in active / recently-closed window."
+                                            ).style(
+                                                f"color: {TEXT_MUTED}; font-style: italic; "
+                                                f"font-size: 12px; padding: 4px 8px;"
+                                            )
 
                             # Unslated group
                             unslated = [n for n in hierarchy["unslated"]

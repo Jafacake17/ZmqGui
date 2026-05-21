@@ -54,6 +54,7 @@ if not hasattr(sys.modules["nicegui.app"], "storage"):
 from zmq_gui.app import (
     _build_book_hierarchy, _filter_book_node,
     _closed_badge_color, _is_closed_blocked, _fmt_sched_col,
+    _build_constraint_chips,
 )
 
 RED = "#dc3c3c"; TEXT_SECONDARY = "#8c8ca0"
@@ -304,3 +305,44 @@ def test_v4_closed_at_key_in_lifecycle_shape():
     node = {"record": v4_record, "children": []}
     assert _filter_book_node(node, "closed24h") is False
 
+
+
+# ── slate card renders when constituents empty ────────────────────────────────
+
+def test_slate_card_renders_when_lifecycle_empty():
+    """Slate card must appear even when lifecycle[] has no matching records."""
+    snap = _snap(
+        lifecycle=[],  # no records at all
+        slates=[_slate("2wk", [1, 2], constraints={
+            "SC1": {"passed": True, "reason": "ok"},
+            "SC2": {"passed": False, "reason": "no hawkish hedge"},
+        })],
+    )
+    h = _build_book_hierarchy(snap)
+    # Slate group exists, but top_level_records is empty
+    assert len(h["slate_groups"]) == 1
+    slate_grp = h["slate_groups"][0]
+    assert len(slate_grp["top_level_records"]) == 0
+    # Constraint chips can still be built for the slate
+    chips = _build_constraint_chips(
+        slate_grp["slate"].get("slate_constraints_status") or {})
+    labels = [c["label"] for c in chips]
+    assert "SC1" in labels
+    assert "SC2" in labels
+    sc2 = next(c for c in chips if c["label"] == "SC2")
+    assert sc2["color"] == RED  # failed
+
+
+def test_slate_constraint_chips_have_reason_in_tooltip():
+    """Constraint chip tooltip carries the full reason string."""
+    snap = _snap(
+        lifecycle=[],
+        slates=[_slate("2wk", [1], constraints={
+            "SC2": {"passed": False, "reason": "no hawkish hedge construct in slate"},
+        })],
+    )
+    h = _build_book_hierarchy(snap)
+    cs = h["slate_groups"][0]["slate"].get("slate_constraints_status") or {}
+    chips = _build_constraint_chips(cs)
+    sc2 = next(c for c in chips if c["label"] == "SC2")
+    assert "hawkish" in sc2["tooltip"]
