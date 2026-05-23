@@ -36,6 +36,7 @@ tabs:
   quick_screen: false  # Ad-hoc backtest builder over the Quick Screen RPC service
   sta_book:         true   # STA Book: hierarchical slate→trade→leg view with filters
   sta_diagnostics:  true   # STA Diagnostics: chain explorer + audit timeline + sidecar health
+  sta_closed:       true   # STA Closed: all terminal records, paginated table
 
 # --- FTMO tab ---
 # The FTMO tab reads EA activity directly from the MT5 log files,

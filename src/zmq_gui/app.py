@@ -1256,6 +1256,10 @@ class Dashboard:
                     ui.tab("STA Diagnostics").style(f"color: {TEXT_PRIMARY};")
                     if cfg.tabs.get("sta_diagnostics", True) else None
                 )
+                sta_closed_tab = (
+                    ui.tab("STA Closed").style(f"color: {TEXT_PRIMARY};")
+                    if cfg.tabs.get("sta_closed", True) else None
+                )
 
             # Restore the last-selected tab across page reloads via per-browser
             # user storage. Falls back to the first enabled tab if the saved
@@ -1271,6 +1275,7 @@ class Dashboard:
                     ("Quick Screen", qs_tab),
                     ("STA Book", sta_book_tab),
                     ("STA Diagnostics", sta_diagnostics_tab),
+                    ("STA Closed", sta_closed_tab),
                 ) if t is not None
             ]
             saved_tab = app.storage.user.get("active_tab")
@@ -3692,6 +3697,99 @@ class Dashboard:
                                            0, str(e.value) if e.value is not None else None),
                                                   update_sta_diagnostics()))
                     ui.timer(2.0, update_sta_diagnostics)
+
+              # ================ STA CLOSED TAB ================
+              # Paginated table of all terminal lifecycle records.
+              if sta_closed_tab is not None:
+                with ui.tab_panel(sta_closed_tab):
+                    _closed_status = ui.label(
+                        "Waiting for first STA heartbeat on tcp://127.0.0.1:5570…"
+                    ).style(f"color: {YELLOW}; font-style: italic; font-size: 13px; margin-top: 4px;")
+
+                    _sta_closed_page = [0]
+                    _CLOSED_PAGE_SIZE = 20
+
+                    with ui.row().classes("items-center gap-2 mt-2"):
+                        _closed_prev_btn = ui.button("← Prev").props("dense flat").style(
+                            f"color: {TEXT_SECONDARY}; font-size: 12px;")
+                        _closed_page_label = ui.label("").style(
+                            f"color: {TEXT_SECONDARY}; font-size: 12px;")
+                        _closed_next_btn = ui.button("Next →").props("dense flat").style(
+                            f"color: {TEXT_SECONDARY}; font-size: 12px;")
+
+                    _closed_table_area = ui.column().classes("w-full mt-2")
+
+                    def render_closed_table():
+                        _closed_table_area.clear()
+                        with dashboard._lock:
+                            snap = dashboard._sta_latest
+                            last_ts = dashboard._sta_last_ts
+                        if snap is None:
+                            return
+                        rows_all = snap.get("closed_all") or []
+                        total = len(rows_all)
+                        total_pages = max(1, (total + _CLOSED_PAGE_SIZE - 1) // _CLOSED_PAGE_SIZE)
+                        _sta_closed_page[0] = max(0, min(_sta_closed_page[0], total_pages - 1))
+                        page = _sta_closed_page[0]
+                        page_rows = rows_all[page * _CLOSED_PAGE_SIZE:(page + 1) * _CLOSED_PAGE_SIZE]
+                        age_s = time.time() - last_ts
+                        _closed_status.set_text(
+                            f"v{snap.get('schema_version', '?')} · {total} closed · "
+                            f"page {page + 1}/{total_pages} · {_fmt_age(age_s)} ago"
+                        )
+                        _closed_status.style(replace=f"color: {TEXT_SECONDARY}; font-size: 12px;")
+                        _closed_page_label.set_text(f"Page {page + 1} / {total_pages}")
+                        with _closed_table_area:
+                            table_rows = []
+                            for rec in page_rows:
+                                spec_id = rec.get("spec_id") or "?"
+                                label = _derive_label(spec_id)
+                                tt_label, _ = _derive_trade_type(spec_id)
+                                closed_at_raw = rec.get("closed_at") or ""
+                                closed_at_str = ""
+                                if closed_at_raw:
+                                    try:
+                                        dt = datetime.fromisoformat(closed_at_raw)
+                                        closed_at_str = dt.strftime("%Y-%m-%d %H:%M")
+                                    except ValueError:
+                                        closed_at_str = closed_at_raw[:16]
+                                reason = (rec.get("last_reason") or "")[:80]
+                                table_rows.append({
+                                    "id": rec.get("record_id", "?"),
+                                    "name": label,
+                                    "type": tt_label,
+                                    "closed": closed_at_str,
+                                    "reason": reason,
+                                })
+                            cols = [
+                                {"name": "id",     "label": "#",      "field": "id",     "align": "left"},
+                                {"name": "name",   "label": "Name",   "field": "name",   "align": "left"},
+                                {"name": "type",   "label": "Type",   "field": "type",   "align": "left"},
+                                {"name": "closed", "label": "Closed", "field": "closed", "align": "left"},
+                                {"name": "reason", "label": "Reason", "field": "reason", "align": "left"},
+                            ]
+                            ui.table(columns=cols, rows=table_rows, row_key="id").style(
+                                f"background-color: {BG_PANEL}; font-size: 12px;"
+                            ).classes("w-full")
+
+                    def _closed_go_prev():
+                        _sta_closed_page[0] = max(0, _sta_closed_page[0] - 1)
+                        render_closed_table()
+
+                    def _closed_go_next():
+                        with dashboard._lock:
+                            snap = dashboard._sta_latest
+                        if snap is None:
+                            return
+                        rows_all = snap.get("closed_all") or []
+                        total_pages = max(1, (len(rows_all) + _CLOSED_PAGE_SIZE - 1) // _CLOSED_PAGE_SIZE)
+                        _sta_closed_page[0] = min(total_pages - 1, _sta_closed_page[0] + 1)
+                        render_closed_table()
+
+                    _closed_prev_btn.on("click", lambda: _closed_go_prev())
+                    _closed_next_btn.on("click", lambda: _closed_go_next())
+
+                    ui.timer(30.0, render_closed_table)
 
             # ---- Periodic UI update — Console tab refresh ----
             # Skipped when Console tab is disabled.

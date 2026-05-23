@@ -350,3 +350,48 @@ def test_screenshot_both_sta_tabs():
         finally:
             await browser.close(); await pw.stop()
     asyncio.run(run())
+
+
+@skip_if_unavailable
+def test_sta_closed_tab_loads():
+    """STA Closed tab loads and shows status label."""
+    async def run():
+        page, errors, browser, pw = await _open_page()
+        try:
+            await _click_tab(page, "STA Closed")
+            await page.wait_for_timeout(1500)
+            body = await page.inner_text("body")
+            # Either waiting label or "X closed" status — tab rendered without crash
+            assert ("tcp://127.0.0.1:5570" in body or "closed" in body.lower()), \
+                "STA Closed tab: expected status label not found"
+            real_errors = [(t, m) for t, m in errors if "Resize" not in m]
+            assert real_errors == [], f"Console errors on STA Closed tab: {real_errors[:3]}"
+        finally:
+            await browser.close(); await pw.stop()
+    asyncio.run(run())
+
+
+@skip_if_unavailable
+def test_sta_closed_tab_shows_data():
+    """STA Closed tab shows closed records once heartbeat with closed_all arrives."""
+    async def run():
+        page, _, browser, pw = await _open_page()
+        try:
+            await _click_tab(page, "STA Closed")
+            # Wait up to 75s for heartbeat (60s tick + buffer)
+            deadline = time.time() + 75
+            got_data = False
+            while time.time() < deadline:
+                body = await page.inner_text("body")
+                # Status line updates from "Waiting…" once a heartbeat arrives
+                if "closed ·" in body:
+                    got_data = True
+                    break
+                await page.wait_for_timeout(2000)
+            assert got_data, "STA Closed tab: status never updated from 'Waiting…'"
+            # Page label visible
+            body = await page.inner_text("body")
+            assert "Page" in body, "Pagination label missing"
+        finally:
+            await browser.close(); await pw.stop()
+    asyncio.run(run())
