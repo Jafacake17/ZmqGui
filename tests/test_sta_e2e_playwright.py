@@ -354,16 +354,20 @@ def test_screenshot_both_sta_tabs():
 
 @skip_if_unavailable
 def test_sta_closed_tab_loads():
-    """STA Closed tab loads and shows status label."""
+    """Closed inner sub-tab (inside STA Book) loads and shows status label."""
     async def run():
         page, errors, browser, pw = await _open_page()
         try:
-            await _click_tab(page, "STA Closed")
+            await _click_tab(page, "STA Book")
+            # Click the inner "Closed" sub-tab within STA Book
+            closed_btn = page.locator("text=Closed").first
+            assert await closed_btn.count() > 0, "Inner 'Closed' sub-tab not found"
+            await closed_btn.click()
             await page.wait_for_timeout(1500)
             body = await page.inner_text("body")
             # Either waiting label or "X closed" status — tab rendered without crash
             assert ("tcp://127.0.0.1:5570" in body or "closed" in body.lower()), \
-                "STA Closed tab: expected status label not found"
+                "STA Closed inner-tab: expected status label not found"
             real_errors = [(t, m) for t, m in errors if "Resize" not in m]
             assert real_errors == [], f"Console errors on STA Closed tab: {real_errors[:3]}"
         finally:
@@ -373,11 +377,14 @@ def test_sta_closed_tab_loads():
 
 @skip_if_unavailable
 def test_sta_closed_tab_shows_data():
-    """STA Closed tab shows closed records once heartbeat with closed_all arrives."""
+    """Closed inner sub-tab shows records once heartbeat with closed_all arrives."""
     async def run():
         page, _, browser, pw = await _open_page()
         try:
-            await _click_tab(page, "STA Closed")
+            await _click_tab(page, "STA Book")
+            closed_btn = page.locator("text=Closed").first
+            assert await closed_btn.count() > 0, "Inner 'Closed' sub-tab not found"
+            await closed_btn.click()
             # Wait up to 75s for heartbeat (60s tick + buffer)
             deadline = time.time() + 75
             got_data = False
@@ -388,7 +395,7 @@ def test_sta_closed_tab_shows_data():
                     got_data = True
                     break
                 await page.wait_for_timeout(2000)
-            assert got_data, "STA Closed tab: status never updated from 'Waiting…'"
+            assert got_data, "STA Closed inner-tab: status never updated from 'Waiting…'"
             # Page label visible
             body = await page.inner_text("body")
             assert "Page" in body, "Pagination label missing"
