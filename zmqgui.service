@@ -1,0 +1,26 @@
+# systemd-user unit for the ZmqGui NiceGUI dashboard.
+#
+# Install:
+#   cp /home/jacob/ZmqGui/zmqgui.service ~/.config/systemd/user/zmqgui.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now zmqgui.service
+#
+# Logs:  journalctl --user -u zmqgui -f
+# URL:   http://100.68.92.74:8080 (Tailscale) or http://127.0.0.1:8080
+
+[Unit]
+Description=ZmqGui — NiceGUI dashboard for ModularTradeApp + Arbitrage + Crypto bus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/jacob/ZmqGui
+ExecStart=/home/jacob/ZmqGui/.venv/bin/zmq-gui --config /home/jacob/ZmqGui/config.yaml
+Restart=on-failure
+RestartSec=10
+# NiceGUI + plotly + zmq subscribers — modest. 1G is plenty.
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target
